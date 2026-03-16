@@ -17,7 +17,9 @@ We formalize the trading process as a Markov Decision Process (MDP) defined by t
 * **Action Space ($\mathcal{A}$):** A discrete action space defined as $\mathcal{A} = \{-1, 0, 1\}$, corresponding respectively to Sell, Hold (Do Nothing), and Buy.
 * **Reward Function ($\mathcal{R}$):** The reward $r_t$ evaluates the simulated profit of the agent's position. To penalize excessive trading and enforce realism, a transaction cost $c > 0$ is strictly subtracted whenever the agent transitions between different market positions.
 * **Trajectory Representation:** The Decision Transformer operates on sequences of length $K$:
+
     $$\tau = (\hat{R}_1, s_1, a_1, \hat{R}_2, s_2, a_2, \dots, \hat{R}_K, s_K, a_K)$$
+
     where $\hat{R}_t = \sum_{t'=t}^{T} r_{t'}$ is the Return-to-Go.
 
 ## Methodology & Technologies
