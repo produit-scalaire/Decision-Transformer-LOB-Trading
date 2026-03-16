@@ -1,6 +1,6 @@
 # Reinforcement Learning via Sequence Modeling for Market Data
 
-**Authors**: Côme Genet & Clément Callaer  
+**Authors**: Côme Genet & Clément Callaert  
 **Date**: February 2026  
 
 ## Project Overview
