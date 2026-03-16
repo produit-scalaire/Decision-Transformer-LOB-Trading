@@ -20,7 +20,7 @@ We formalize the trading process as a Markov Decision Process (MDP) defined by t
 
     $$\tau = (\hat{R}_1, s_1, a_1, \hat{R}_2, s_2, a_2, \dots, \hat{R}_K, s_K, a_K)$$
 
-    where $\hat{R}_t = \sum_{t'=t}^{T} r_{t'}$ is the Return-to-Go.
+    where $\hat{R}_{t} = \sum_{t'=t}^{T} r_{t'}$ is the Return-to-Go.
 
 ## Methodology & Technologies
 
