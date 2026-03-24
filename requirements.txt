@@ -3,6 +3,7 @@ numpy>=1.24
 pandas>=2.0
 matplotlib>=3.7
 torch>=2.0
+gymnasium>=0.29
 tqdm>=4.65
 jupyter>=1.0.0
 ipywidgets>=8.0
