@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from decision_transformer import DecisionTransformer
+from DecisionTransformer import DecisionTransformer
 
 # -----------------------------------------------------------------------------
 # 1. Dataset Class (Zero-copy GPU loading strategy)

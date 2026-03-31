@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
-from decision_transformer import DecisionTransformer
+from DecisionTransformer import DecisionTransformer
 
 # -----------------------------------------------------------------------------
 # 1. Financial Evaluation Metrics
