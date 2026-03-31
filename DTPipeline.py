@@ -85,7 +85,7 @@ def main():
     # ---------------------------------------------------------
     if not args.skip_train:
         cmd_train = [
-            sys.executable, "train.py",
+            sys.executable, "PipelineTraining.py",
             "--data_path", str(args.data_file),
             "--epochs", str(args.epochs),
             "--batch_size", str(args.batch_size),

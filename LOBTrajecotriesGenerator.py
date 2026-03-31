@@ -241,6 +241,11 @@ def main():
     lob_data, labels = load_or_download_dataset(args.dataset)
     max_idx = len(lob_data)
 
+    print("warming up LLVM JIT compiler to prevent race conditions...")
+    # L'appel factice force la compilation dans le parent
+    _ = run_episode_optimized(lob_data[:50], labels[:50], 0, 10, 0)
+    _ = compute_rtg_vectorized(np.zeros(10, dtype=np.float32), 1.0)
+
     trajectories = []
     
     # compute optimal worker count leaving 2 cores for the OS and parent process
