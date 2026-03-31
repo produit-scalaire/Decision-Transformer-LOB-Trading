@@ -70,7 +70,7 @@ def main():
     # ---------------------------------------------------------
     if not args.skip_data:
         cmd_data = [
-            sys.executable, "generate_trajectories.py",
+            sys.executable, "LOBTrajecotriesGenerator.py",
             "--dataset", str(args.dataset),
             "--num_trajectories", str(args.num_trajectories),
             "--seq_len", str(args.seq_len),
