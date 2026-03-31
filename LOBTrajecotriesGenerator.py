@@ -1,11 +1,35 @@
 import os
-import urllib.request
+# restrict c++ backend threading before any heavy library import
+# this prevents thread thrashing when spawning multiple workers
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import argparse
 import numpy as np
 import torch
-import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from numba import njit
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+
+# global pointers for copy on write shared memory
+# these remain none in the parent process
+# they are populated only in the child processes memory space
+SHARED_LOB_DATA = None
+SHARED_LABELS = None
+
+
+def init_worker(lob_data_ref, labels_ref):
+    """
+    initializer function executed once per worker upon creation
+    binds the parent memory references to the child global scope
+    """
+    global SHARED_LOB_DATA, SHARED_LABELS
+    SHARED_LOB_DATA = lob_data_ref
+    SHARED_LABELS = labels_ref
+    
+    # strictly enforce single thread execution for pytorch operations
+    torch.set_num_threads(1)
 
 # ---------------------------------------------------------
 # Mathematical Core: RTG & Fast Numba JIT Compilation
@@ -80,7 +104,7 @@ def run_episode_optimized(lob_data: np.ndarray, labels: np.ndarray, start_idx: i
                 elif delta < 0: action = 0
                     
         elif policy_id == 4:
-            # Policy 5: Label-momentum (Requires FI-2010 labels array)
+            # Policy 5: Label-momentum (Requires FI-2010 labels array with at least 4 cols)
             label = int(labels[idx, 3])
             if label == 1: action = 0
             elif label == 3: action = 2
@@ -115,26 +139,6 @@ def run_episode_optimized(lob_data: np.ndarray, labels: np.ndarray, start_idx: i
         rewards[t] = np.float32(reward)
         
     return states, actions, rewards
-
-def worker_routine(lob_shared: np.ndarray, labels_shared: np.ndarray, max_idx: int, seq_len: int, seed: int) -> dict:
-    """Wrapper function executed by multiprocessing pool."""
-    np.random.seed(seed)
-    
-    # Ensure margin for 20-step momentum lookup and sequence length
-    start_idx = np.random.randint(20, max_idx - seq_len - 1) 
-    
-    # Equiprobable policy selection for uniform support coverage
-    policy_id = np.random.randint(0, 6)
-    
-    states, actions, rewards = run_episode_optimized(lob_shared, labels_shared, start_idx, seq_len, policy_id)
-    rtg = compute_rtg_vectorized(rewards, gamma=1.0)
-    
-    return {
-        "states": torch.from_numpy(states).bfloat16(), # Optimized for RTX 5090 Blackwell
-        "actions": torch.from_numpy(actions).long(),
-        "rtg": torch.from_numpy(rtg).unsqueeze(-1).bfloat16(),
-        "timesteps": torch.arange(seq_len, dtype=torch.long)
-    }
 
 # ---------------------------------------------------------
 # Data Acquisition & Cache Management
@@ -180,62 +184,95 @@ def load_or_download_dataset(dataset_name: str, cache_dir: str = "./data_cache")
         
     return lob_data, labels
 
+
 # ---------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------
 
+def worker_routine(max_idx: int, seq_len: int, seed: int) -> dict:
+    """
+    independent worker task
+    does not take massive arrays as arguments to avoid pickle serialization
+    reads strictly from shared memory pointers
+    """
+    np.random.seed(seed)
+    
+    # ensure boundary safety for trajectory sampling
+    start_idx = np.random.randint(20, max_idx - seq_len - 1)
+    policy_id = np.random.randint(0, 6)
+    
+    # execute deterministic rollout using read only shared memory
+    states, actions, rewards = run_episode_optimized(
+        SHARED_LOB_DATA, 
+        SHARED_LABELS, 
+        start_idx, 
+        seq_len, 
+        policy_id
+    )
+    
+    rtg = compute_rtg_vectorized(rewards, gamma=1.0)
+    
+    # cast to optimized tensor formats
+    return {
+        "states": torch.from_numpy(states).bfloat16(),
+        "actions": torch.from_numpy(actions).long(),
+        "rtg": torch.from_numpy(rtg).unsqueeze(-1).bfloat16(),
+        "timesteps": torch.arange(seq_len, dtype=torch.long)
+    }
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Multi-Policy Offline RL Trajectory Generator")
-    parser.add_argument("--dataset", type=str, choices=["fi2010", "deeplob"], required=True, help="Dataset choice")
-    parser.add_argument("--num_trajectories", type=int, default=10000, help="Total episodes to generate")
-    parser.add_argument("--seq_len", type=int, default=1024, help="Sequence length K")
-    parser.add_argument("--output", type=str, default="offline_dataset.pt", help="Output PyTorch binary file")
-    
+    parser = argparse.ArgumentParser(description="offline trajectory generation pipeline")
+    parser.add_argument("--dataset", type=str, required=True)
+    parser.add_argument("--num_trajectories", type=int, default=50000)
+    parser.add_argument("--seq_len", type=int, default=1024)
+    parser.add_argument("--output", type=str, default="offline_dataset.pt")
     args = parser.parse_args()
-    
-    # 1. Dataset Loading (Parent Process)
+
+    print("============================================================")
+    print(f"Dataset         : {args.dataset.upper()}")
+    print(f"Trajectories    : {args.num_trajectories}")
+    print(f"Sequence Length : {args.seq_len}")
+    print("============================================================")
+
+    # ---------------------------------------------------------
+    # CORRECTED: Delegate data loading to the robust function
+    # ---------------------------------------------------------
     lob_data, labels = load_or_download_dataset(args.dataset)
     max_idx = len(lob_data)
-    
-    # Hardware topology detection
-    # Reserving 2 threads for the OS, utilizing the remaining 30 for pure parallel crunching
-    cpu_cores = os.cpu_count() or 32
-    workers = max(1, cpu_cores - 2) 
-    
-    print("="*60)
-    print(f"Dataset         : {args.dataset.upper()} ({max_idx} limit order book snapshots)")
-    print(f"Trajectories    : {args.num_trajectories}")
-    print(f"Target Hardware : AMD Ryzen 9 9950X ({workers} active workers)")
-    print(f"Tensor Config   : torch.bfloat16 (Optimized for RTX 5090 Blackwell)")
-    print("="*60)
-    
+
     trajectories = []
-    start_time = time.time()
     
-    # 2. Parallel Rollout Execution via Copy-On-Write
-    with ProcessPoolExecutor(max_workers=workers) as executor:
+    # compute optimal worker count leaving 2 cores for the OS and parent process
+    available_cores = os.cpu_count() or 4
+    num_workers = max(1, available_cores - 2)
+    print(f"Target Hardware : {available_cores} cores detected")
+    print(f"Active Workers  : {num_workers}")
+
+    # orchestrate process pool with copy on write initializer
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=init_worker,
+        initargs=(lob_data, labels)
+    ) as executor:
+        
+        # submit all tasks returning future objects
         futures = [
-            executor.submit(
-                worker_routine, 
-                lob_data,
-                labels,
-                max_idx, 
-                args.seq_len, 
-                seed=i
-            ) for i in range(args.num_trajectories)
+            executor.submit(worker_routine, max_idx, args.seq_len, seed)
+            for seed in range(args.num_trajectories)
         ]
         
-        for i, future in enumerate(as_completed(futures)):
-            trajectories.append(future.result())
-            if (i + 1) % 1000 == 0:
-                print(f"Processed {i + 1} / {args.num_trajectories} trajectories...")
-                
-    elapsed = time.time() - start_time
-    print(f"Generation fully completed in {elapsed:.2f} seconds.")
-    
-    # 3. Serialization directly to GPU-ready layout
-    print(f"Serializing artifacts to {args.output}...")
+        # collect results as they complete
+        for future in tqdm(as_completed(futures), total=args.num_trajectories, desc="generating trajectories"):
+            try:
+                result = future.result()
+                trajectories.append(result)
+            except Exception as e:
+                print(f"worker execution failed: {e}")
+
+    print(f"saving dataset to {args.output}...")
     torch.save(trajectories, args.output)
+    print("pipeline execution complete")
+
 
 if __name__ == "__main__":
-    main()
