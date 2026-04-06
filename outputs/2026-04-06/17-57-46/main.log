@@ -1,0 +1,45 @@
+[2026-04-06 17:57:46,044][__main__][INFO] - Pipeline initialized with configuration:
+pipeline:
+  run_generation: false
+  run_training: true
+  run_evaluation: true
+hardware:
+  workers: 8
+  device: cuda
+  compile_model: true
+paths:
+  train_data: data/train_trajectories.pt
+  test_data: data/test_trajectories.pt
+  model_dir: models
+  plot_dir: plots
+generator:
+  train_episodes: 50000
+  test_episodes: 1200
+  window_size: 100
+  episode_length: 2000
+model:
+  state_dim: 41
+  act_dim: 3
+  d_model: 128
+  n_heads: 4
+  n_layers: 3
+  max_timestep: 10000
+  dropout: 0.1
+training:
+  epochs: 10
+  batch_size: 2048
+  context_len: 100
+  lr: 0.0001
+  weight_decay: 0.0001
+evaluation:
+  target_rtgs:
+  - 0.0
+  - 0.2
+  - 0.5
+  - 1.0
+  - 2.0
+  context_len: 100
+  max_eval_trajectories: 32
+
+[2026-04-06 17:57:46,044][__main__][INFO] - Skipping Data Generation Phase.
+[2026-04-06 17:57:46,044][__main__][INFO] - Starting Training Phase...

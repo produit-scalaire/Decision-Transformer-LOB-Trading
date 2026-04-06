@@ -11,3 +11,4 @@ src/env/__pycache__
 src/models/__pycache__
 src/training/__pycache__
 src/data/row
+output/

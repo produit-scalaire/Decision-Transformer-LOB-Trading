@@ -1,0 +1,3 @@
+- pipeline.run_generation=false
+- pipeline.run_training=false
+- hardware.workers=8

@@ -23,7 +23,7 @@ paths:
 
 # Data generation parameters
 generator:
-  train_episodes: 6000
+  train_episodes: 50000
   test_episodes: 1200
   window_size: 100
   episode_length: 2000
@@ -40,7 +40,7 @@ model:
 
 # Optimization & Training
 training:
-  epochs: 15
+  epochs: 10
   batch_size: 2048     # Keep huge for RTX 5090 32GB VRAM
   context_len: 100
   lr: 1e-4
@@ -48,6 +48,6 @@ training:
 
 # Inference & Validation
 evaluation:
-  target_rtgs: [0.5, 1.0, 2.0]
+  target_rtgs: [0.0, 0.2 ,0.5, 1.0, 2.0]
   context_len: 100
   max_eval_trajectories: 32
