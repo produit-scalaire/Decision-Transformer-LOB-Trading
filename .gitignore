@@ -2,3 +2,12 @@
 .DS_Store
 Papers/reinforcement-learning-lecture-notes.pdf
 Papers/Guidelines_in_ML_seance2.pdf
+test_trajectories.pt
+train_trajectories.pt
+dt_lob_weights.pt
+.gitignore
+src/data/__pycache__
+src/env/__pycache__
+src/models/__pycache__
+src/training/__pycache__
+src/data/row

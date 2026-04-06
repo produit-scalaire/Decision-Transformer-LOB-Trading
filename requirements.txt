@@ -7,3 +7,4 @@ gymnasium>=0.29
 tqdm>=4.65
 jupyter>=1.0.0
 ipywidgets>=8.0
+scikit-learn>=1.2
