@@ -29,7 +29,7 @@ generator:
   episode_length: 2000
   # mid_price: PnL from mid changes only (default for DT / offline data).
   # shaped: same base PnL minus drawdown, rolling return variance, and |position| penalties.
-  reward_type: mid_price
+  reward_type: shaped
   reward_shaping:
     drawdown_coef: 0.02
     variance_coef: 0.5
@@ -51,7 +51,7 @@ model:
 
 # Optimization & Training
 training:
-  epochs: 15
+  epochs: 5
   batch_size: 2048     # Keep huge for RTX 5090 32GB VRAM
   context_len: 100
   lr: 1e-4

@@ -164,6 +164,8 @@ The project root must be the current working directory so imports resolve (`src.
 - [x] **State Space Engineering:** Switchable observation construction for ask/bid **price** levels only—**`raw`** (dataset layout), **`log_returns`**, or **`bps`**—with **`generator.price_offset`** for numerical stability on z-scored data; volumes unchanged; dim stays 41. Implemented in `src/env/lob_trading_env.py`, config keys `generator.state_representation` / `generator.price_offset`, trajectory `init_worker` wiring in `src/data/trajectories_generator.py`, evaluation helpers in `src/evaluations/market_returns.py` and `evaluate_model(..., state_representation=...)` in `src/evaluations/dt_viz.py`; covered in `tests/test.py`.
 - [x] **Context Horizon Profiling:** Benchmark Sharpe ratio and macro-F1 (vs instantaneous mid-proxy oracle) across attention windows $K \in \{50, 100, 250, 500\}$ via per-$K$ training checkpoints and `scripts/context_horizon_profile.py`. DeepLOB (Zhang et al., 2018) FI-2010 movement F1 at horizons $k \in \{10,50,100\}$ is cited in the script plot as a qualitative reference only (different dataset and label definition).
 - [ ] **Architectural Scaling:** Conduct ablation studies on the transformer depth and width (`d_model`, `n_heads`, `n_layers`) relative to the available 32GB VRAM.
+- [ ] **CNN architecture:** Test with a CNN-based encoder (or architecture variant); add a Hydra/config parameter to switch between the current setup and the CNN path.
+- [ ] **Return-to-go horizon ($T$):** Make the horizon $T$ in the future-reward sum $\hat{R}_t = \sum_{t'=t}^{T} r_{t'}$ configurable or otherwise modifiable (decoupled from raw episode length where appropriate).
 
 ### Dataset & Environment Expansion
 
