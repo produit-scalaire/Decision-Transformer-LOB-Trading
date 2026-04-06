@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from src.models.decision_transformer import DecisionTransformer
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 # -----------------------------------------------------------------------------
 # 1. Dataset Class (Optimized for Huge Datasets)

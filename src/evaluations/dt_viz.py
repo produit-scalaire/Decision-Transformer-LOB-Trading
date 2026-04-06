@@ -109,8 +109,9 @@ def vectorized_autoregressive_rollout(model, states, market_returns, target_rtg,
             last_pred = action_preds[:, -1, :]  # Shape: (B, act_dim)
             action = torch.argmax(last_pred, dim=-1)  # Shape: (B,)
             
-            # 4. Map action to financial position: 0 -> Hold (0), 1 -> Buy (+1), 2 -> Sell (-1)
-            pos = torch.where(action == 1, 1.0, torch.where(action == 2, -1.0, 0.0))
+            # 4. Map action to position (must match LOBTradingEnv.action_to_position)
+            #    0 -> short (-1), 1 -> flat (0), 2 -> long (+1)
+            pos = action.float() - 1.0
             
             # 5. Evaluate Step Reward using the actual market return
             step_reward = pos * market_returns[:, t]
@@ -247,7 +248,13 @@ def evaluate_model(model_path, data_path, eval_cfg, model_cfg, plot_dir):
     ).to(device)
     
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    raw_state_dict = checkpoint['model_state_dict']
+    
+    # [PATCH] Remove '_orig_mod.' prefix added by torch.compile() during training
+    # This allows loading a compiled checkpoint into a vanilla PyTorch module
+    clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in raw_state_dict.items()}
+    
+    model.load_state_dict(clean_state_dict)
     
     # 2. Load Testing Dataset (Memory efficient partial load)
     print(f"Loading testing data from {data_path}...")
@@ -348,7 +355,12 @@ if __name__ == "__main__":
     ).to(device)
     
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    raw_state_dict = checkpoint['model_state_dict']
+    
+    # [PATCH] Remove '_orig_mod.' prefix added by torch.compile() during training
+    clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in raw_state_dict.items()}
+    
+    model.load_state_dict(clean_state_dict)
     
     # 2. Load Testing Dataset (Memory efficient partial load)
     print(f"Loading testing data from {args.data_path}...")

@@ -80,6 +80,33 @@ python main.py pipeline.run_training=false pipeline.run_evaluation=false hardwar
 python main.py pipeline.run_generation=false pipeline.run_training=false 'evaluation.target_rtgs=[0.5, 1.0, 3.0, 5.0]'
 ```
 
+## Tests
+
+The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment, trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run all tests:
+
+```bash
+pytest
+```
+
+Run only the main test module with verbose output:
+
+```bash
+pytest tests/test.py -v
+```
+
+Run a single test by name:
+
+```bash
+pytest tests/test.py::test_dt_causality -v
+```
+
+The project root must be the current working directory so imports resolve (`src.*` packages). `pytest.ini` configures collection so `tests/test.py` is discovered even though its name is not `test_*.py`.
 
 ## To Do / Future Work
 

@@ -9,6 +9,10 @@ dt_lob_weights.pt
 src/data/__pycache__
 src/env/__pycache__
 src/models/__pycache__
-src/training/__pycache__
+src/training/__pycache__/
 src/data/row
-output/
+outputs/
+src/evaluations/__pycache__/
+models/
+tests/__pycache__
+src/evaluations/__pycache__
