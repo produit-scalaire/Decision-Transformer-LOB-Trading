@@ -8,8 +8,7 @@ import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
-
+from src.evaluations.direction_metrics import compute_directional_f1
 from src.models.decision_transformer import DecisionTransformer
 from src.evaluations.market_returns import get_market_returns
 
@@ -45,6 +44,7 @@ def compute_financial_metrics(rewards_tensor: torch.Tensor) -> dict:
         "MaxDD": max_dd
     }
 
+
 # =============================================================================
 # 2. Autoregressive Rollout & Baselines
 # =============================================================================
@@ -63,6 +63,7 @@ def vectorized_autoregressive_rollout(model, states, market_returns, target_rtg,
     ctx_timesteps = torch.zeros((B, context_len), dtype=torch.long, device=device)
     
     predicted_positions = torch.zeros((B, T), device=device)
+    predicted_actions = torch.zeros((B, T), dtype=torch.long, device=device)
     realized_rewards = torch.zeros((B, T), device=device)
     
     current_rtg = torch.full((B, 1), target_rtg, device=device)
@@ -101,13 +102,14 @@ def vectorized_autoregressive_rollout(model, states, market_returns, target_rtg,
             
             # Save stats
             predicted_positions[:, t] = pos
+            predicted_actions[:, t] = action
             realized_rewards[:, t] = step_reward
             
             # 6. Update context for next iteration
             ctx_actions[:, -1] = action
             current_rtg = current_rtg - step_reward.unsqueeze(-1)
             
-    return realized_rewards, predicted_positions
+    return realized_rewards, predicted_positions, predicted_actions
 
 def evaluate_baselines(market_returns: torch.Tensor):
     """
@@ -234,7 +236,8 @@ def evaluate_model(
         d_model=model_cfg.d_model,
         n_heads=model_cfg.n_heads,
         n_layers=model_cfg.n_layers,
-        max_timestep=model_cfg.max_timestep
+        max_timestep=model_cfg.max_timestep,
+        dropout=model_cfg.dropout,
     ).to(device)
     
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
@@ -284,7 +287,7 @@ def evaluate_model(
     for rtg in eval_cfg.target_rtgs:
         print(f"  [>] Rolling out DT with Target RTG = {rtg}...")
         
-        realized_rewards, predicted_pos = vectorized_autoregressive_rollout(
+        realized_rewards, predicted_pos, predicted_actions = vectorized_autoregressive_rollout(
             model=model,
             states=states_batch,
             market_returns=market_returns,
@@ -297,7 +300,9 @@ def evaluate_model(
         dt_pnl = realized_rewards.cumsum(dim=1)
         
         all_trajectories[agent_name] = dt_pnl.mean(dim=0).cpu().numpy()
-        all_metrics[agent_name] = compute_financial_metrics(realized_rewards)
+        m = compute_financial_metrics(realized_rewards)
+        m["F1_macro"] = compute_directional_f1(predicted_actions, market_returns)
+        all_metrics[agent_name] = m
 
     # 6. Consolidate Results & Print Table
     df_metrics = pd.DataFrame.from_dict(all_metrics, orient='index')
@@ -306,7 +311,11 @@ def evaluate_model(
     print("BACKTEST SUMMARY (Test Set)")
     print("=" * 65)
     for _, row in df_metrics.iterrows():
-        print(f"  {row.name:<20} | PnL: {row['PnL']:+.6f} | Sharpe: {row['Sharpe']:+.4f} | MaxDD: {row['MaxDD']:.6f}")
+        f1_s = f"{row['F1_macro']:.4f}" if "F1_macro" in row and pd.notna(row.get("F1_macro")) else "—"
+        print(
+            f"  {row.name:<20} | PnL: {row['PnL']:+.6f} | Sharpe: {row['Sharpe']:+.4f} | "
+            f"MaxDD: {row['MaxDD']:.6f} | F1_macro: {f1_s}"
+        )
     print("=" * 65)
 
     # 7. Generate Enhanced Visualizations
@@ -399,7 +408,7 @@ if __name__ == "__main__":
     for rtg in args.target_rtgs:
         print(f"  [>] Rolling out DT with Target RTG = {rtg}...")
         
-        realized_rewards, predicted_pos = vectorized_autoregressive_rollout(
+        realized_rewards, predicted_pos, predicted_actions = vectorized_autoregressive_rollout(
             model=model,
             states=states_batch,
             market_returns=market_returns,
@@ -412,7 +421,9 @@ if __name__ == "__main__":
         dt_pnl = realized_rewards.cumsum(dim=1)
         
         all_trajectories[agent_name] = dt_pnl.mean(dim=0).cpu().numpy()
-        all_metrics[agent_name] = compute_financial_metrics(realized_rewards)
+        m = compute_financial_metrics(realized_rewards)
+        m["F1_macro"] = compute_directional_f1(predicted_actions, market_returns)
+        all_metrics[agent_name] = m
 
     # 6. Consolidate Results & Print Table
     df_metrics = pd.DataFrame.from_dict(all_metrics, orient='index')
@@ -421,7 +432,11 @@ if __name__ == "__main__":
     print("BACKTEST SUMMARY (Test Set)")
     print("=" * 65)
     for _, row in df_metrics.iterrows():
-        print(f"  {row.name:<20} | PnL: {row['PnL']:+.6f} | Sharpe: {row['Sharpe']:+.4f} | MaxDD: {row['MaxDD']:.6f}")
+        f1_s = f"{row['F1_macro']:.4f}" if "F1_macro" in row and pd.notna(row.get("F1_macro")) else "—"
+        print(
+            f"  {row.name:<20} | PnL: {row['PnL']:+.6f} | Sharpe: {row['Sharpe']:+.4f} | "
+            f"MaxDD: {row['MaxDD']:.6f} | F1_macro: {f1_s}"
+        )
     print("=" * 65)
 
     # 7. Generate Enhanced Visualizations

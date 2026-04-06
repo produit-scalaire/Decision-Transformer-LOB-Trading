@@ -13,6 +13,7 @@ from src.env.lob_trading_env import LOBTradingEnv, LOB_PRICE_COL_INDICES
 from src.models.decision_transformer import DecisionTransformer
 from src.training.training_pipeline import OptimizedTrajectoryDataset, configure_optimizers
 from src.data.trajectories_generator import rollout_worker, init_worker
+from src.evaluations.direction_metrics import oracle_actions_from_returns, compute_directional_f1
 
 # =============================================================================
 # FIXTURES (DUMMY DATA & MOCKS)
@@ -419,6 +420,25 @@ def test_dt_forward_pass_shapes():
     
     logits = model(states, actions, rtg, timesteps)
     assert logits.shape == (B, K, act_dim), f"Expected {(B, K, act_dim)}, got {logits.shape}"
+
+
+def test_oracle_actions_from_returns_maps_sign_to_dt_indices():
+    r = torch.tensor([[0.1, -0.5, 0.0], [0.0, 0.02, -0.01]])
+    o = oracle_actions_from_returns(r)
+    assert o.shape == r.shape
+    assert o[0, 0].item() == 2
+    assert o[0, 1].item() == 0
+    assert o[0, 2].item() == 1
+    assert o[1, 0].item() == 1
+
+
+def test_compute_directional_f1_perfect_when_matching_oracle():
+    # Include positive, negative, and zero returns so all three oracle classes appear (macro-F1).
+    r = torch.tensor([[0.5, -0.3, 0.0, 0.02, -0.01]])
+    oracle = oracle_actions_from_returns(r)
+    f1 = compute_directional_f1(oracle, r)
+    assert f1 == pytest.approx(1.0)
+
 
 @torch.no_grad()
 def test_dt_causality():

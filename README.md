@@ -109,6 +109,25 @@ python main.py generator.state_representation=log_returns
 python main.py pipeline.run_generation=false pipeline.run_training=false 'evaluation.target_rtgs=[0.5, 1.0, 3.0, 5.0]'
 ```
 
+**Context horizon sweep (train one checkpoint per $K$, then profile):** use a separate `paths.model_dir` per context length so `dt_model_final.pt` files are not overwritten, then aggregate:
+
+```bash
+for K in 50 100 250 500; do
+  python main.py pipeline.run_generation=false \
+    training.context_len=$K evaluation.context_len=$K \
+    paths.model_dir=models/context_K${K}
+done
+python scripts/context_horizon_profile.py \
+  --checkpoints \
+    50=models/context_K50/dt_model_final.pt \
+    100=models/context_K100/dt_model_final.pt \
+    250=models/context_K250/dt_model_final.pt \
+    500=models/context_K500/dt_model_final.pt \
+  --state_representation=raw
+```
+
+Evaluation summaries from `main.py` also report **F1_macro** for Decision Transformer rows (agreement with the same oracle used in the profile script).
+
 ## Tests
 
 The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment (including mid vs. shaped rewards, stationary state modes, and evaluation market-return helpers), trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
@@ -143,7 +162,7 @@ The project root must be the current working directory so imports resolve (`src.
 
 - [x] **Reward Shaping Formulation:** Parameterize the reward function to penalize drawdowns, variance, or time-in-market, moving beyond simple mid-price PnL. Implemented via `generator.reward_type` / `generator.reward_shaping` in `configs/config.yaml`, `LOBTradingEnv` in `src/env/lob_trading_env.py`, and the trajectory generator worker wiring; covered by tests in `tests/test.py`.
 - [x] **State Space Engineering:** Switchable observation construction for ask/bid **price** levels only—**`raw`** (dataset layout), **`log_returns`**, or **`bps`**—with **`generator.price_offset`** for numerical stability on z-scored data; volumes unchanged; dim stays 41. Implemented in `src/env/lob_trading_env.py`, config keys `generator.state_representation` / `generator.price_offset`, trajectory `init_worker` wiring in `src/data/trajectories_generator.py`, evaluation helpers in `src/evaluations/market_returns.py` and `evaluate_model(..., state_representation=...)` in `src/evaluations/dt_viz.py`; covered in `tests/test.py`.
-- [ ] **Context Horizon Profiling:** Benchmark model performance (Sharpe Ratio, F1-Score) across varying attention window sizes ($K \in \{50, 100, 250, 500\}$) to evaluate memory decay vs. predictive power.
+- [x] **Context Horizon Profiling:** Benchmark Sharpe ratio and macro-F1 (vs instantaneous mid-proxy oracle) across attention windows $K \in \{50, 100, 250, 500\}$ via per-$K$ training checkpoints and `scripts/context_horizon_profile.py`. DeepLOB (Zhang et al., 2018) FI-2010 movement F1 at horizons $k \in \{10,50,100\}$ is cited in the script plot as a qualitative reference only (different dataset and label definition).
 - [ ] **Architectural Scaling:** Conduct ablation studies on the transformer depth and width (`d_model`, `n_heads`, `n_layers`) relative to the available 32GB VRAM.
 
 ### Dataset & Environment Expansion
