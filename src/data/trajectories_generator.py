@@ -33,17 +33,30 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 global_env = None
 global_labels = None
 
-def init_worker(X_data, y_data, window_size, episode_length):
+def init_worker(
+    X_data,
+    y_data,
+    window_size,
+    episode_length,
+    reward_type="mid_price",
+    reward_shaping=None,
+):
     """
     Initializer function called ONCE per worker process when the Pool is created.
     It sets up the trading environment in the worker's local memory space.
     """
     global global_env, global_labels
+    rs = reward_shaping or {}
     global_env = LOBTradingEnv(
-        X_data, 
-        window_size=window_size, 
-        transaction_cost=0.0, 
-        episode_length=episode_length
+        X_data,
+        window_size=window_size,
+        transaction_cost=0.0,
+        episode_length=episode_length,
+        reward_type=reward_type,
+        drawdown_coef=float(rs.get("drawdown_coef", 0.0)),
+        variance_coef=float(rs.get("variance_coef", 0.0)),
+        time_in_market_coef=float(rs.get("time_in_market_coef", 0.0)),
+        variance_window=int(rs.get("variance_window", 20)),
     )
     global_labels = y_data
 
@@ -214,13 +227,25 @@ def rollout_worker(args):
 # -----------------------------------------------------------------------------
 # DATASET GENERATION PIPELINE
 # -----------------------------------------------------------------------------
-def generate_dataset(X, y, num_episodes, output_file, num_workers, desc="Generating"):
+def generate_dataset(
+    X,
+    y,
+    num_episodes,
+    output_file,
+    num_workers,
+    desc="Generating",
+    window_size=100,
+    episode_length=2000,
+    reward_type="mid_price",
+    reward_shaping=None,
+):
     """
     Distributes the generation of trajectories across all CPU cores.
     Converts the returned NumPy arrays into PyTorch tensors safely in the main process.
     """
     print(f"\n--- Starting {desc} Generation ---")
     print(f"Data shape: {X.shape} | Episodes: {num_episodes} | Workers: {num_workers}")
+    print(f"Reward: {reward_type} | window={window_size} len={episode_length}")
     
     # Create job list (assigning equal number of episodes to each policy)
     episodes_per_policy = num_episodes // len(POLICIES)
@@ -235,9 +260,11 @@ def generate_dataset(X, y, num_episodes, output_file, num_workers, desc="Generat
     all_trajectories = []
     
     # We use initializer to pass the heavy Data Arrays ONCE per worker.
-    with Pool(processes=num_workers, 
-              initializer=init_worker, 
-              initargs=(X, y, 100, 2000)) as pool:
+    with Pool(
+        processes=num_workers,
+        initializer=init_worker,
+        initargs=(X, y, window_size, episode_length, reward_type, reward_shaping),
+    ) as pool:
         
         # Process jobs and show progress bar
         with tqdm(total=len(jobs), desc=desc, unit="ep") as pbar:
@@ -271,7 +298,18 @@ def generate_dataset(X, y, num_episodes, output_file, num_workers, desc="Generat
 # -----------------------------------------------------------------------------
 # MAIN EXECUTION
 # -----------------------------------------------------------------------------
-def generate_dataset_pipeline(train_episodes: int, test_episodes: int, workers: int, train_out: str, test_out: str, plot_dir: str):
+def generate_dataset_pipeline(
+    train_episodes: int,
+    test_episodes: int,
+    workers: int,
+    train_out: str,
+    test_out: str,
+    plot_dir: str,
+    window_size: int = 100,
+    episode_length: int = 2000,
+    reward_type: str = "mid_price",
+    reward_shaping: dict | None = None,
+):
     """Encapsulated entry point for Hydra orchestrator."""
     # 1. Download Dataset via kagglehub
     print("Downloading/Locating FI-2010 dataset...")
@@ -290,12 +328,16 @@ def generate_dataset_pipeline(train_episodes: int, test_episodes: int, workers: 
     
     # Generate Train Dataset
     train_trajectories = generate_dataset(
-        X=X_train, 
-        y=y_train, 
-        num_episodes=train_episodes, 
-        output_file=train_out, 
+        X=X_train,
+        y=y_train,
+        num_episodes=train_episodes,
+        output_file=train_out,
         num_workers=workers,
-        desc="Train Dataset"
+        desc="Train Dataset",
+        window_size=window_size,
+        episode_length=episode_length,
+        reward_type=reward_type,
+        reward_shaping=reward_shaping,
     )
     
     # Generate Train plots
@@ -312,12 +354,16 @@ def generate_dataset_pipeline(train_episodes: int, test_episodes: int, workers: 
     
     # Generate Test Dataset
     test_trajectories = generate_dataset(
-        X=X_test, 
-        y=y_test, 
-        num_episodes=test_episodes, 
-        output_file=test_out, 
+        X=X_test,
+        y=y_test,
+        num_episodes=test_episodes,
+        output_file=test_out,
         num_workers=workers,
-        desc="Test Dataset"
+        desc="Test Dataset",
+        window_size=window_size,
+        episode_length=episode_length,
+        reward_type=reward_type,
+        reward_shaping=reward_shaping,
     )
     
     # Generate Test plots

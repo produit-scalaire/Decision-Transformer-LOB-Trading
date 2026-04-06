@@ -5,7 +5,8 @@ Follows the DeepLOB paper setting:
   - Observation: window of W consecutive LOB snapshots (each with 40 raw features)
                  plus the agent's current inventory position.
   - Action:      desired position in {-1 (short), 0 (flat), +1 (long)}.
-  - Reward:      position * delta_mid_price  -  transaction_cost * |delta_position|.
+  - Reward:      position * delta_mid_price  -  transaction_cost * |delta_position|,
+                 optionally with additive shaping (drawdown / variance / time-in-market).
 """
 
 from __future__ import annotations
@@ -13,6 +14,9 @@ from __future__ import annotations
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+
+
+_REWARD_TYPES = frozenset({"mid_price", "shaped"})
 
 
 class LOBTradingEnv(gym.Env):
@@ -31,6 +35,18 @@ class LOBTradingEnv(gym.Env):
         Cost per unit of absolute position change.
     episode_length : int or None
         Fixed episode length (random start). If None the full dataset is one episode.
+    reward_type : str
+        ``"mid_price"`` — PnL from mid moves and transaction costs only.
+        ``"shaped"`` — same base PnL minus penalties (drawdown from peak equity on base PnL,
+        rolling variance of base step returns, and |position| for time in market).
+    drawdown_coef : float
+        Weight on (peak_base_equity - current_base_equity) when ``reward_type=="shaped"``.
+    variance_coef : float
+        Weight on rolling variance of recent base step rewards when shaped.
+    time_in_market_coef : float
+        Weight on |position| after the action when shaped.
+    variance_window : int
+        Max history length for the rolling variance term (>= 1).
     """
 
     metadata = {"render_modes": []}
@@ -41,6 +57,11 @@ class LOBTradingEnv(gym.Env):
         window_size: int = 100,
         transaction_cost: float = 0.0,
         episode_length: int | None = None,
+        reward_type: str = "mid_price",
+        drawdown_coef: float = 0.0,
+        variance_coef: float = 0.0,
+        time_in_market_coef: float = 0.0,
+        variance_window: int = 20,
     ):
         super().__init__()
 
@@ -51,11 +72,22 @@ class LOBTradingEnv(gym.Env):
                 f"Data length ({lob_data.shape[0]}) must exceed "
                 f"window_size ({window_size})"
             )
+        if reward_type not in _REWARD_TYPES:
+            raise ValueError(
+                f"reward_type must be one of {sorted(_REWARD_TYPES)}, got {reward_type!r}"
+            )
+        if variance_window < 1:
+            raise ValueError("variance_window must be >= 1")
 
         self.lob_data = lob_data.astype(np.float32)
         self.window_size = window_size
         self.transaction_cost = transaction_cost
         self.episode_length = episode_length
+        self.reward_type = reward_type
+        self.drawdown_coef = float(drawdown_coef)
+        self.variance_coef = float(variance_coef)
+        self.time_in_market_coef = float(time_in_market_coef)
+        self.variance_window = int(variance_window)
 
         # Mid-price: (best_ask + best_bid) / 2  (columns 0 and 2)
         self.mid_prices = (self.lob_data[:, 0] + self.lob_data[:, 2]) / 2.0
@@ -87,6 +119,11 @@ class LOBTradingEnv(gym.Env):
         self._position: int = 0
         self._start_step: int = 0
         self._end_step: int = 0
+
+        # Shaped reward: equity and risk stats use base (mid-price) step PnL only.
+        self._equity_base: float = 0.0
+        self._peak_equity: float = 0.0
+        self._base_reward_buf: list[float] = []
 
     # ------------------------------------------------------------------
     # Action <-> position helpers
@@ -135,6 +172,9 @@ class LOBTradingEnv(gym.Env):
 
         self._current_step = self._start_step
         self._position = 0
+        self._equity_base = 0.0
+        self._peak_equity = 0.0
+        self._base_reward_buf = []
 
         return self._get_obs(), {
             "mid_price": float(self.mid_prices[self._current_step]),
@@ -151,10 +191,29 @@ class LOBTradingEnv(gym.Env):
         price_next = self.mid_prices[self._current_step + 1]
         price_change = price_next - price_now
 
-        reward = float(
-            new_position * price_change
-            - self.transaction_cost * delta_pos
+        base_reward = float(
+            new_position * price_change - self.transaction_cost * delta_pos
         )
+
+        if self.reward_type == "mid_price":
+            reward = base_reward
+            drawdown_pen = 0.0
+            var_pen = 0.0
+            time_pen = 0.0
+        else:
+            self._equity_base += base_reward
+            self._peak_equity = max(self._peak_equity, self._equity_base)
+            drawdown = self._peak_equity - self._equity_base
+            drawdown_pen = self.drawdown_coef * drawdown
+
+            self._base_reward_buf.append(base_reward)
+            if len(self._base_reward_buf) > self.variance_window:
+                self._base_reward_buf.pop(0)
+            step_var = float(np.var(self._base_reward_buf))
+            var_pen = self.variance_coef * step_var
+
+            time_pen = self.time_in_market_coef * abs(new_position)
+            reward = base_reward - drawdown_pen - var_pen - time_pen
 
         self._position = new_position
         self._current_step += 1
@@ -168,5 +227,7 @@ class LOBTradingEnv(gym.Env):
             "position": self._position,
             "price_change": float(price_change),
             "transaction_cost_paid": float(self.transaction_cost * delta_pos),
+            "base_reward": base_reward,
+            "reward_shaping_penalty": float(drawdown_pen + var_pen + time_pen),
         }
         return obs, reward, terminated, truncated, info

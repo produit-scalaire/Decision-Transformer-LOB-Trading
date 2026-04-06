@@ -47,13 +47,20 @@ def main(cfg: DictConfig) -> None:
     if cfg.pipeline.run_generation:
         log.info("Starting Data Generation Phase...")
         # Inject specific configs downstream
+        reward_shaping = OmegaConf.to_container(
+            cfg.generator.reward_shaping, resolve=True
+        )
         generate_dataset_pipeline(
             train_episodes=cfg.generator.train_episodes,
             test_episodes=cfg.generator.test_episodes,
             workers=cfg.hardware.workers,
             train_out=cfg.paths.train_data,
             test_out=cfg.paths.test_data,
-            plot_dir=cfg.paths.plot_dir
+            plot_dir=cfg.paths.plot_dir,
+            window_size=cfg.generator.window_size,
+            episode_length=cfg.generator.episode_length,
+            reward_type=cfg.generator.reward_type,
+            reward_shaping=reward_shaping,
         )
     else:
         log.info("Skipping Data Generation Phase.")

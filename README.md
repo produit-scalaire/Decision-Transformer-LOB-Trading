@@ -35,6 +35,15 @@ $$\mathcal{A} = \{-1, 0, 1\} \quad \text{(Sell, Hold, Buy)}$$
 ### Reward Function ($\mathcal{R}$)
 $r_t$ evaluates the mark-to-market simulated profit. To penalize excessive churn and enforce strict microstructural realism, a transaction cost $c > 0$ is subtracted for any non-zero $\Delta$ in the agent's inventory.
 
+**Configurable reward modes** (`configs/config.yaml` → `generator.reward_type`):
+
+| Mode | Definition |
+|------|------------|
+| **`mid_price`** (default) | Step reward is base PnL only: position $\times$ change in mid price minus transaction costs. This is what the Decision Transformer conditions on when learning from RTGs. |
+| **`shaped`** | Same base PnL, minus optional penalties controlled by `generator.reward_shaping`: drawdown from the running peak of **cumulative base PnL**, rolling variance of recent **base** step rewards (window `variance_window`), and a **time-in-market** term proportional to $\| \text{position} \|$. Use this when you want offline data or experiments that encode risk aversion beyond raw mid moves. |
+
+Trajectory generation (`src/data/trajectories_generator.py`) and `main.py` pass these settings into `LOBTradingEnv` so workers and the Hydra pipeline stay aligned.
+
 ### Trajectory Representation
 The causal transformer operates on context windows of length $K$:
 
@@ -74,6 +83,12 @@ python main.py pipeline.run_generation=false pipeline.run_evaluation=false train
 python main.py pipeline.run_training=false pipeline.run_evaluation=false hardware.workers=48 generator.train_episodes=100000
 ```
 
+**Switch to shaped rewards** for data generation (override coefficients as needed):
+
+```bash
+python main.py pipeline.run_training=false pipeline.run_evaluation=false generator.reward_type=shaped
+```
+
 **Evaluate a specific checkpoint** across different target Returns-to-Go:
 
 ```bash
@@ -82,7 +97,7 @@ python main.py pipeline.run_generation=false pipeline.run_training=false 'evalua
 
 ## Tests
 
-The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment, trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
+The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment (including mid vs. shaped rewards), trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
 
 ```bash
 pip install -r requirements.txt
@@ -112,7 +127,7 @@ The project root must be the current working directory so imports resolve (`src.
 
 ### Core Experimentation
 
-- [ ] **Reward Shaping Formulation:** Parameterize the reward function to penalize drawdowns, variance, or time-in-market, moving beyond simple mid-price PnL.
+- [x] **Reward Shaping Formulation:** Parameterize the reward function to penalize drawdowns, variance, or time-in-market, moving beyond simple mid-price PnL. Implemented via `generator.reward_type` / `generator.reward_shaping` in `configs/config.yaml`, `LOBTradingEnv` in `src/env/lob_trading_env.py`, and the trajectory generator worker wiring; covered by tests in `tests/test.py`.
 - [ ] **State Space Engineering:** Experiment with alternative state representations (e.g., transforming absolute prices into stationary log-returns or relative basis points).
 - [ ] **Context Horizon Profiling:** Benchmark model performance (Sharpe Ratio, F1-Score) across varying attention window sizes ($K \in \{50, 100, 250, 500\}$) to evaluate memory decay vs. predictive power.
 - [ ] **Architectural Scaling:** Conduct ablation studies on the transformer depth and width (`d_model`, `n_heads`, `n_layers`) relative to the available 32GB VRAM.

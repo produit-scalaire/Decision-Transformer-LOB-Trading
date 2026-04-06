@@ -112,6 +112,98 @@ def test_lob_env_constructor_rejects_bad_shapes():
         LOBTradingEnv(lob_data=good[:10], window_size=10, episode_length=5)
 
 
+def test_lob_env_rejects_unknown_reward_type(dummy_lob_data: np.ndarray):
+    with pytest.raises(ValueError, match="reward_type"):
+        LOBTradingEnv(
+            lob_data=dummy_lob_data,
+            window_size=10,
+            reward_type="unknown",
+        )
+
+
+def flat_mid_lob(num_rows: int) -> np.ndarray:
+    """Constant mid-price so base step PnL is zero when position is fixed."""
+    x = np.zeros((num_rows, 40), dtype=np.float32)
+    x[:, 0] = 100.0
+    x[:, 2] = 100.0
+    return x
+
+
+def test_lob_env_shaped_penalizes_time_in_market_when_mid_flat():
+    """
+    With shaped rewards, |position| term lowers reward vs mid_price when base PnL is zero.
+    """
+    data = flat_mid_lob(80)
+    w = 10
+    lam_t = 0.01
+    env_shaped = LOBTradingEnv(
+        lob_data=data,
+        window_size=w,
+        transaction_cost=0.0,
+        episode_length=30,
+        reward_type="shaped",
+        drawdown_coef=0.0,
+        variance_coef=0.0,
+        time_in_market_coef=lam_t,
+        variance_window=20,
+    )
+    env_plain = LOBTradingEnv(
+        lob_data=data,
+        window_size=w,
+        transaction_cost=0.0,
+        episode_length=30,
+        reward_type="mid_price",
+    )
+    env_shaped.reset(seed=0)
+    env_plain.reset(seed=0)
+    _, r_shaped, _, _, info_s = env_shaped.step(2)
+    _, r_plain, _, _, info_p = env_plain.step(2)
+    assert info_s["base_reward"] == pytest.approx(0.0)
+    assert info_p.get("base_reward") == pytest.approx(info_s["base_reward"])
+    assert r_plain == pytest.approx(0.0)
+    assert r_shaped == pytest.approx(-lam_t * abs(1))
+
+
+def test_trajectories_rollout_matches_env_reward_mode():
+    """
+    init_worker + rollout_worker must use the same reward logic as a direct env rollout.
+    """
+    data = flat_mid_lob(120)
+    labels = np.zeros((120, 5), dtype=np.float32)
+    labels[:, 3] = 2
+
+    shaping = {
+        "drawdown_coef": 0.0,
+        "variance_coef": 0.0,
+        "time_in_market_coef": 0.02,
+        "variance_window": 10,
+    }
+    init_worker(data, labels, window_size=10, episode_length=25, reward_type="shaped", reward_shaping=shaping)
+    out = rollout_worker(("random", 0))
+
+    env = LOBTradingEnv(
+        lob_data=data,
+        window_size=10,
+        transaction_cost=0.0,
+        episode_length=25,
+        reward_type="shaped",
+        time_in_market_coef=0.02,
+        variance_window=10,
+        drawdown_coef=0.0,
+        variance_coef=0.0,
+    )
+    env.reset(seed=0)
+    replay = []
+    for a in out["actions"]:
+        _, r, term, trunc, _ = env.step(int(a))
+        replay.append(r)
+        if term or trunc:
+            break
+
+    assert len(replay) == len(out["rewards"])
+    np.testing.assert_array_almost_equal(out["rewards"], np.array(replay, dtype=np.float32))
+
+
 def test_lob_env_invalid_action_raises(dummy_lob_data: np.ndarray):
     env = LOBTradingEnv(
         lob_data=dummy_lob_data,
