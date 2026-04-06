@@ -2,6 +2,7 @@ kagglehub>=0.3.0
 numpy>=1.24
 pandas>=2.0
 matplotlib>=3.7
+seaborn>=0.13
 torch>=2.0
 gymnasium>=0.29
 tqdm>=4.65

@@ -27,7 +27,15 @@ This pipeline has been specifically architected and optimized for high-end local
 We formalize the trading process as a Markov Decision Process (MDP) defined by the tuple $(\mathcal{S}, \mathcal{A}, \mathcal{P}, \mathcal{R}, \gamma)$, adapted for an offline autoregressive sequence modeling approach:
 
 ### State Space ($\mathcal{S}$)
-A temporal window of normalized Limit Order Book (LOB) data (depth of 10 levels, yielding a 41-dimensional vector including time/features).
+A temporal window of normalized Limit Order Book (LOB) data (depth of 10 levels) is stacked with the scalar position to form a **41-dimensional** flattened state (40 LOB features + 1). By default (**`raw`**) the LOB channels are used as loaded (e.g. z-scored snapshots). Optionally, **stationary price channels** can be enabled so only ask/bid **prices** are transformed per tick; **volumes are unchanged**:
+
+| Mode (`generator.state_representation`) | Price columns (20 levels) |
+|----------------------------------------|---------------------------|
+| **`raw`** | Snapshot values as in the dataset |
+| **`log_returns`** | \(\log(p_t + \delta) - \log(p_{t-1} + \delta)\) with configurable **`generator.price_offset`** \(\delta\) (stabilizes z-scored levels) |
+| **`bps`** | \((p_t - p_{t-1}) / (\|p_{t-1}\| + \delta) \times 10^4\) |
+
+The environment applies this inside `LOBTradingEnv` (`src/env/lob_trading_env.py`); trajectory workers and Hydra use the same flags. Evaluation rollouts (`src/evaluations/market_returns.py`, wired from `main.py`) must use the same `state_representation` as the test trajectories. State dimensionality stays **41** across modes so the Decision Transformer input size does not change.
 
 ### Action Space ($\mathcal{A}$)
 $$\mathcal{A} = \{-1, 0, 1\} \quad \text{(Sell, Hold, Buy)}$$
@@ -42,7 +50,7 @@ $r_t$ evaluates the mark-to-market simulated profit. To penalize excessive churn
 | **`mid_price`** (default) | Step reward is base PnL only: position $\times$ change in mid price minus transaction costs. This is what the Decision Transformer conditions on when learning from RTGs. |
 | **`shaped`** | Same base PnL, minus optional penalties controlled by `generator.reward_shaping`: drawdown from the running peak of **cumulative base PnL**, rolling variance of recent **base** step rewards (window `variance_window`), and a **time-in-market** term proportional to $\| \text{position} \|$. Use this when you want offline data or experiments that encode risk aversion beyond raw mid moves. |
 
-Trajectory generation (`src/data/trajectories_generator.py`) and `main.py` pass these settings into `LOBTradingEnv` so workers and the Hydra pipeline stay aligned.
+Trajectory generation (`src/data/trajectories_generator.py`) and `main.py` pass reward and state-representation settings into `LOBTradingEnv` so workers and the Hydra pipeline stay aligned.
 
 ### Trajectory Representation
 The causal transformer operates on context windows of length $K$:
@@ -89,6 +97,12 @@ python main.py pipeline.run_training=false pipeline.run_evaluation=false hardwar
 python main.py pipeline.run_training=false pipeline.run_evaluation=false generator.reward_type=shaped
 ```
 
+**Use stationary LOB prices** (log-returns on price levels; regenerate data and retrain—the model is not interchangeable with `raw` checkpoints):
+
+```bash
+python main.py generator.state_representation=log_returns
+```
+
 **Evaluate a specific checkpoint** across different target Returns-to-Go:
 
 ```bash
@@ -97,7 +111,7 @@ python main.py pipeline.run_generation=false pipeline.run_training=false 'evalua
 
 ## Tests
 
-The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment (including mid vs. shaped rewards), trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
+The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment (including mid vs. shaped rewards, stationary state modes, and evaluation market-return helpers), trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
 
 ```bash
 pip install -r requirements.txt
@@ -128,7 +142,7 @@ The project root must be the current working directory so imports resolve (`src.
 ### Core Experimentation
 
 - [x] **Reward Shaping Formulation:** Parameterize the reward function to penalize drawdowns, variance, or time-in-market, moving beyond simple mid-price PnL. Implemented via `generator.reward_type` / `generator.reward_shaping` in `configs/config.yaml`, `LOBTradingEnv` in `src/env/lob_trading_env.py`, and the trajectory generator worker wiring; covered by tests in `tests/test.py`.
-- [ ] **State Space Engineering:** Experiment with alternative state representations (e.g., transforming absolute prices into stationary log-returns or relative basis points).
+- [x] **State Space Engineering:** Switchable observation construction for ask/bid **price** levels only—**`raw`** (dataset layout), **`log_returns`**, or **`bps`**—with **`generator.price_offset`** for numerical stability on z-scored data; volumes unchanged; dim stays 41. Implemented in `src/env/lob_trading_env.py`, config keys `generator.state_representation` / `generator.price_offset`, trajectory `init_worker` wiring in `src/data/trajectories_generator.py`, evaluation helpers in `src/evaluations/market_returns.py` and `evaluate_model(..., state_representation=...)` in `src/evaluations/dt_viz.py`; covered in `tests/test.py`.
 - [ ] **Context Horizon Profiling:** Benchmark model performance (Sharpe Ratio, F1-Score) across varying attention window sizes ($K \in \{50, 100, 250, 500\}$) to evaluate memory decay vs. predictive power.
 - [ ] **Architectural Scaling:** Conduct ablation studies on the transformer depth and width (`d_model`, `n_heads`, `n_layers`) relative to the available 32GB VRAM.
 

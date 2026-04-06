@@ -35,6 +35,9 @@ generator:
     variance_coef: 0.5
     time_in_market_coef: 0.0005
     variance_window: 20
+  # raw: LOB as loaded | log_returns | bps (price channels only; volumes unchanged)
+  state_representation: raw
+  price_offset: 10.0
 
 # Decision Transformer architecture
 model:

@@ -40,6 +40,8 @@ def init_worker(
     episode_length,
     reward_type="mid_price",
     reward_shaping=None,
+    state_representation="raw",
+    price_offset=10.0,
 ):
     """
     Initializer function called ONCE per worker process when the Pool is created.
@@ -57,6 +59,8 @@ def init_worker(
         variance_coef=float(rs.get("variance_coef", 0.0)),
         time_in_market_coef=float(rs.get("time_in_market_coef", 0.0)),
         variance_window=int(rs.get("variance_window", 20)),
+        state_representation=state_representation,
+        price_offset=float(price_offset),
     )
     global_labels = y_data
 
@@ -238,6 +242,8 @@ def generate_dataset(
     episode_length=2000,
     reward_type="mid_price",
     reward_shaping=None,
+    state_representation="raw",
+    price_offset=10.0,
 ):
     """
     Distributes the generation of trajectories across all CPU cores.
@@ -245,7 +251,10 @@ def generate_dataset(
     """
     print(f"\n--- Starting {desc} Generation ---")
     print(f"Data shape: {X.shape} | Episodes: {num_episodes} | Workers: {num_workers}")
-    print(f"Reward: {reward_type} | window={window_size} len={episode_length}")
+    print(
+        f"Reward: {reward_type} | state={state_representation} | "
+        f"window={window_size} len={episode_length}"
+    )
     
     # Create job list (assigning equal number of episodes to each policy)
     episodes_per_policy = num_episodes // len(POLICIES)
@@ -263,7 +272,16 @@ def generate_dataset(
     with Pool(
         processes=num_workers,
         initializer=init_worker,
-        initargs=(X, y, window_size, episode_length, reward_type, reward_shaping),
+        initargs=(
+            X,
+            y,
+            window_size,
+            episode_length,
+            reward_type,
+            reward_shaping,
+            state_representation,
+            price_offset,
+        ),
     ) as pool:
         
         # Process jobs and show progress bar
@@ -309,6 +327,8 @@ def generate_dataset_pipeline(
     episode_length: int = 2000,
     reward_type: str = "mid_price",
     reward_shaping: dict | None = None,
+    state_representation: str = "raw",
+    price_offset: float = 10.0,
 ):
     """Encapsulated entry point for Hydra orchestrator."""
     # 1. Download Dataset via kagglehub
@@ -338,6 +358,8 @@ def generate_dataset_pipeline(
         episode_length=episode_length,
         reward_type=reward_type,
         reward_shaping=reward_shaping,
+        state_representation=state_representation,
+        price_offset=price_offset,
     )
     
     # Generate Train plots
@@ -364,6 +386,8 @@ def generate_dataset_pipeline(
         episode_length=episode_length,
         reward_type=reward_type,
         reward_shaping=reward_shaping,
+        state_representation=state_representation,
+        price_offset=price_offset,
     )
     
     # Generate Test plots

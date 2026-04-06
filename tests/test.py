@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.env.lob_trading_env import LOBTradingEnv
+from src.env.lob_trading_env import LOBTradingEnv, LOB_PRICE_COL_INDICES
 from src.models.decision_transformer import DecisionTransformer
 from src.training.training_pipeline import OptimizedTrajectoryDataset, configure_optimizers
 from src.data.trajectories_generator import rollout_worker, init_worker
@@ -121,6 +121,68 @@ def test_lob_env_rejects_unknown_reward_type(dummy_lob_data: np.ndarray):
         )
 
 
+def test_lob_env_rejects_unknown_state_representation(dummy_lob_data: np.ndarray):
+    with pytest.raises(ValueError, match="state_representation"):
+        LOBTradingEnv(
+            lob_data=dummy_lob_data,
+            window_size=10,
+            state_representation="absolute_zorg",
+        )
+
+
+def test_lob_env_stationary_modes_zero_when_flat_mid():
+    """Constant best bid/ask ⇒ zero log-return / bps on all price levels in the window."""
+    data = flat_mid_lob(80)
+    for rep in ("log_returns", "bps"):
+        env = LOBTradingEnv(
+            lob_data=data,
+            window_size=10,
+            episode_length=20,
+            state_representation=rep,
+            price_offset=10.0,
+        )
+        obs, _ = env.reset(seed=0)
+        pw = obs["lob_window"]
+        np.testing.assert_allclose(
+            pw[:, LOB_PRICE_COL_INDICES], 0.0, atol=1e-5, rtol=0.0
+        )
+
+
+def test_lob_env_stationary_preserves_volume_columns():
+    data = flat_mid_lob(80)
+    data[:, 1] = 0.3
+    data[:, 3] = 0.7
+    data[:, 5] = -0.2
+    vol_idx = [i for i in range(40) if i not in set(LOB_PRICE_COL_INDICES)]
+    env_raw = LOBTradingEnv(
+        lob_data=data, window_size=10, episode_length=5, state_representation="raw"
+    )
+    env_lr = LOBTradingEnv(
+        lob_data=data, window_size=10, episode_length=5, state_representation="log_returns"
+    )
+    o0, _ = env_raw.reset(seed=0)
+    o1, _ = env_lr.reset(seed=0)
+    np.testing.assert_array_equal(o0["lob_window"][:, vol_idx], o1["lob_window"][:, vol_idx])
+
+
+def test_get_market_returns_respects_state_representation():
+    from src.evaluations.market_returns import get_market_returns
+
+    B, T, D = 2, 5, 41
+    s = torch.zeros(B, T, D)
+    s[:, :, 0] = 100.0
+    s[:, :, 2] = 100.0
+    r_raw = get_market_returns(s, "raw")
+    assert r_raw.shape == (B, T)
+    assert torch.allclose(r_raw[:, :-1], torch.zeros_like(r_raw[:, :-1]))
+    assert r_raw[:, -1].abs().max().item() == 0.0
+
+    s2 = torch.randn(B, T, D)
+    r_lr = get_market_returns(s2, "log_returns")
+    assert r_lr.shape == (B, T)
+    assert r_lr[:, -1].abs().max().item() == 0.0
+
+
 def flat_mid_lob(num_rows: int) -> np.ndarray:
     """Constant mid-price so base step PnL is zero when position is fixed."""
     x = np.zeros((num_rows, 40), dtype=np.float32)
@@ -178,7 +240,15 @@ def test_trajectories_rollout_matches_env_reward_mode():
         "time_in_market_coef": 0.02,
         "variance_window": 10,
     }
-    init_worker(data, labels, window_size=10, episode_length=25, reward_type="shaped", reward_shaping=shaping)
+    init_worker(
+        data,
+        labels,
+        window_size=10,
+        episode_length=25,
+        reward_type="shaped",
+        reward_shaping=shaping,
+        state_representation="log_returns",
+    )
     out = rollout_worker(("random", 0))
 
     env = LOBTradingEnv(
@@ -191,6 +261,7 @@ def test_trajectories_rollout_matches_env_reward_mode():
         variance_window=10,
         drawdown_coef=0.0,
         variance_coef=0.0,
+        state_representation="log_returns",
     )
     env.reset(seed=0)
     replay = []

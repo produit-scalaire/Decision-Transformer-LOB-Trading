@@ -11,6 +11,7 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix
 
 from src.models.decision_transformer import DecisionTransformer
+from src.evaluations.market_returns import get_market_returns
 
 # Disable interactive plotting to generate image files safely in the background
 plt.ioff()
@@ -43,24 +44,6 @@ def compute_financial_metrics(rewards_tensor: torch.Tensor) -> dict:
         "Sharpe": sharpe,
         "MaxDD": max_dd
     }
-
-def get_market_returns(states_batch: torch.Tensor) -> torch.Tensor:
-    """
-    Extracts the step-by-step market returns directly from the LOB states.
-    Assumes standard FI-2010 structure where:
-      - states_batch[:, :, 0] is Ask Price 1
-      - states_batch[:, :, 2] is Bid Price 1
-    Even if z-score normalized, the relative price differences provide an accurate 
-    basis for statistical PnL comparison across policies.
-    """
-    ask1 = states_batch[:, :, 0]
-    bid1 = states_batch[:, :, 2]
-    mid_price = (ask1 + bid1) / 2.0
-    
-    returns = torch.zeros_like(mid_price)
-    # Market return at step t is the price change from t to t+1
-    returns[:, :-1] = mid_price[:, 1:] - mid_price[:, :-1]
-    return returns
 
 # =============================================================================
 # 2. Autoregressive Rollout & Baselines
@@ -226,7 +209,14 @@ def plot_pnl_curves(trajectories_dict: dict, save_path: Path):
 # =============================================================================
 # Main Execution Pipeline
 # =============================================================================
-def evaluate_model(model_path, data_path, eval_cfg, model_cfg, plot_dir):
+def evaluate_model(
+    model_path,
+    data_path,
+    eval_cfg,
+    model_cfg,
+    plot_dir,
+    state_representation: str = "raw",
+):
     """Encapsulated entry point for Hydra orchestrator."""
     # Hardware config
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -275,7 +265,9 @@ def evaluate_model(model_path, data_path, eval_cfg, model_cfg, plot_dir):
     print(f"Batch constructed: Shape {states_batch.shape}")
     
     # 3. Extract Market Environment Truths
-    market_returns = get_market_returns(states_batch)
+    market_returns = get_market_returns(
+        states_batch, state_representation=state_representation
+    )
 
     # Master dictionaries to aggregate results for dataframe & plots
     all_trajectories = {}
@@ -333,6 +325,13 @@ if __name__ == "__main__":
     parser.add_argument("--context_len", type=int, default=100, help="Autoregressive sliding window size")
     parser.add_argument("--max_eval_trajectories", type=int, default=32, help="Number of test batch trajectories to evaluate")
     parser.add_argument("--out_dir", type=str, default="visualizations", help="Output directory for plots")
+    parser.add_argument(
+        "--state_representation",
+        type=str,
+        default="raw",
+        choices=("raw", "log_returns", "bps"),
+        help="Must match how test trajectories were generated (LOBTradingEnv.state_representation).",
+    )
     args = parser.parse_args()
 
     # Hardware config
@@ -381,7 +380,9 @@ if __name__ == "__main__":
     print(f"Batch constructed: Shape {states_batch.shape}")
     
     # 3. Extract Market Environment Truths
-    market_returns = get_market_returns(states_batch)
+    market_returns = get_market_returns(
+        states_batch, state_representation=args.state_representation
+    )
 
     # Master dictionaries to aggregate results for dataframe & plots
     all_trajectories = {}

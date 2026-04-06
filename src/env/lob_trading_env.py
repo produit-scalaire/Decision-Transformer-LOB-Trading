@@ -17,6 +17,9 @@ from gymnasium import spaces
 
 
 _REWARD_TYPES = frozenset({"mid_price", "shaped"})
+_STATE_REPRESENTATIONS = frozenset({"raw", "log_returns", "bps"})
+# Per FI-2010 / DeepLOB layout: level k uses columns 4*k+0 .. 4*k+3 for ask_p, ask_v, bid_p, bid_v.
+LOB_PRICE_COL_INDICES = tuple(4 * k + j for k in range(10) for j in (0, 2))
 
 
 class LOBTradingEnv(gym.Env):
@@ -47,6 +50,16 @@ class LOBTradingEnv(gym.Env):
         Weight on |position| after the action when shaped.
     variance_window : int
         Max history length for the rolling variance term (>= 1).
+    state_representation : str
+        ``"raw"`` — return LOB windows as stored (e.g. z-scored snapshots).
+        ``"log_returns"`` — replace each ask/bid **price** level with
+        ``log(p_t + price_offset) - log(p_{t-1} + price_offset)`` (first row of the
+        window uses the previous global tick when available, else zeros).
+        ``"bps"`` — relative change in basis points:
+        ``(p_t - p_{t-1}) / (|p_{t-1}| + price_offset) * 1e4``.
+        Volume columns are always left unchanged.
+    price_offset : float
+        Non-negative shift for log/bps transforms (stabilizes z-scored or small prices).
     """
 
     metadata = {"render_modes": []}
@@ -62,6 +75,8 @@ class LOBTradingEnv(gym.Env):
         variance_coef: float = 0.0,
         time_in_market_coef: float = 0.0,
         variance_window: int = 20,
+        state_representation: str = "raw",
+        price_offset: float = 10.0,
     ):
         super().__init__()
 
@@ -78,6 +93,13 @@ class LOBTradingEnv(gym.Env):
             )
         if variance_window < 1:
             raise ValueError("variance_window must be >= 1")
+        if state_representation not in _STATE_REPRESENTATIONS:
+            raise ValueError(
+                f"state_representation must be one of {sorted(_STATE_REPRESENTATIONS)}, "
+                f"got {state_representation!r}"
+            )
+        if price_offset < 0.0:
+            raise ValueError("price_offset must be non-negative")
 
         self.lob_data = lob_data.astype(np.float32)
         self.window_size = window_size
@@ -88,6 +110,8 @@ class LOBTradingEnv(gym.Env):
         self.variance_coef = float(variance_coef)
         self.time_in_market_coef = float(time_in_market_coef)
         self.variance_window = int(variance_window)
+        self.state_representation = state_representation
+        self.price_offset = float(price_offset)
 
         # Mid-price: (best_ask + best_bid) / 2  (columns 0 and 2)
         self.mid_prices = (self.lob_data[:, 0] + self.lob_data[:, 2]) / 2.0
@@ -140,12 +164,60 @@ class LOBTradingEnv(gym.Env):
         return position + 1
 
     # ------------------------------------------------------------------
+    # Observation construction
+    # ------------------------------------------------------------------
+
+    def _stationary_price_features(
+        self,
+        window: np.ndarray,
+        prev_row: np.ndarray | None,
+    ) -> np.ndarray:
+        """Return a copy of ``window`` with price columns replaced by temporal transforms."""
+        out = window.astype(np.float32, copy=True)
+        cols = LOB_PRICE_COL_INDICES
+        w = window.astype(np.float64, copy=False)
+        c = np.asarray(cols, dtype=int)
+
+        if prev_row is None:
+            out[0, c] = 0.0
+            if window.shape[0] < 2:
+                return out
+            curr = w[1:, c]
+            prev = w[:-1, c]
+        else:
+            p0 = prev_row.astype(np.float64, copy=False)[c].reshape(1, -1)
+            curr = w[:, c]
+            prev = p0 if w.shape[0] == 1 else np.vstack([p0, w[:-1, c]])
+
+        off = self.price_offset
+        if self.state_representation == "log_returns":
+            lc = np.log(np.maximum(curr + off, 1e-8))
+            lp = np.log(np.maximum(prev + off, 1e-8))
+            transformed = lc - lp
+        else:  # bps
+            denom = np.maximum(np.abs(prev) + off, 1e-8)
+            transformed = (curr - prev) / denom * 10000.0
+
+        if prev_row is None:
+            out[1:, c] = transformed.astype(np.float32)
+        else:
+            out[:, c] = transformed.astype(np.float32)
+        return out
+
+    def _transform_lob_window(self, start: int, lob_window: np.ndarray) -> np.ndarray:
+        if self.state_representation == "raw":
+            return lob_window
+        prev = self.lob_data[start - 1] if start > 0 else None
+        return self._stationary_price_features(lob_window, prev)
+
+    # ------------------------------------------------------------------
     # Core Gymnasium API
     # ------------------------------------------------------------------
 
     def _get_obs(self) -> dict:
         start = self._current_step - self.window_size
         lob_window = self.lob_data[start : self._current_step]
+        lob_window = self._transform_lob_window(start, lob_window)
         return {
             "lob_window": lob_window,
             "position": np.array([self._position], dtype=np.float32),

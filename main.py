@@ -61,6 +61,8 @@ def main(cfg: DictConfig) -> None:
             episode_length=cfg.generator.episode_length,
             reward_type=cfg.generator.reward_type,
             reward_shaping=reward_shaping,
+            state_representation=cfg.generator.state_representation,
+            price_offset=float(cfg.generator.price_offset),
         )
     else:
         log.info("Skipping Data Generation Phase.")
@@ -93,7 +95,8 @@ def main(cfg: DictConfig) -> None:
             data_path=cfg.paths.test_data,
             eval_cfg=cfg.evaluation,
             model_cfg=cfg.model,
-            plot_dir=cfg.paths.plot_dir
+            plot_dir=cfg.paths.plot_dir,
+            state_representation=cfg.generator.state_representation,
         )
     else:
         log.info("Skipping Evaluation Phase.")
