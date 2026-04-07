@@ -50,6 +50,8 @@ def main(cfg: DictConfig) -> None:
         reward_shaping = OmegaConf.to_container(
             cfg.generator.reward_shaping, resolve=True
         )
+        # reward_horizon is None (full episode) or a positive integer
+        reward_horizon = cfg.generator.get("reward_horizon", None)
         generate_dataset_pipeline(
             train_episodes=cfg.generator.train_episodes,
             test_episodes=cfg.generator.test_episodes,
@@ -63,6 +65,7 @@ def main(cfg: DictConfig) -> None:
             reward_shaping=reward_shaping,
             state_representation=cfg.generator.state_representation,
             price_offset=float(cfg.generator.price_offset),
+            reward_horizon=int(reward_horizon) if reward_horizon is not None else None,
         )
     else:
         log.info("Skipping Data Generation Phase.")

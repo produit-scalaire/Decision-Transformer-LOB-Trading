@@ -32,6 +32,42 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 # Each worker process loads the environment and data exactly ONCE in RAM.
 global_env = None
 global_labels = None
+global_reward_horizon = None  # None means sum to episode end (standard DT)
+
+
+# -----------------------------------------------------------------------------
+# RETURN-TO-GO COMPUTATION
+# -----------------------------------------------------------------------------
+def compute_rtg(rewards: np.ndarray, horizon: int | None) -> np.ndarray:
+    """
+    Compute return-to-go for every timestep t in an episode of length T.
+
+    Full horizon (horizon=None or horizon<=0):
+        R̂_t = sum(r_t, r_{t+1}, ..., r_{T-1})   [original DT behaviour]
+
+    Bounded horizon H (horizon > 0):
+        R̂_t = sum(r_t, r_{t+1}, ..., r_{min(t+H, T)-1})
+        Rewards more than H steps in the future are excluded.
+
+    Both cases are computed in O(T) using a prefix-sum array.
+    """
+    T = len(rewards)
+
+    # Build prefix sum: prefix[i] = sum of rewards[0..i-1]
+    prefix = np.empty(T + 1, dtype=np.float64)
+    prefix[0] = 0.0
+    np.cumsum(rewards, out=prefix[1:])
+
+    if horizon is None or horizon <= 0:
+        # Sum from t to end of episode
+        end_indices = np.full(T, T, dtype=np.int64)
+    else:
+        # Sum at most `horizon` steps starting from t, clamped to episode end
+        end_indices = np.minimum(np.arange(T, dtype=np.int64) + horizon, T)
+
+    start_indices = np.arange(T, dtype=np.int64)
+    return (prefix[end_indices] - prefix[start_indices]).astype(np.float32)
+
 
 def init_worker(
     X_data,
@@ -42,12 +78,14 @@ def init_worker(
     reward_shaping=None,
     state_representation="raw",
     price_offset=10.0,
+    reward_horizon=None,
 ):
     """
     Initializer function called ONCE per worker process when the Pool is created.
     It sets up the trading environment in the worker's local memory space.
     """
-    global global_env, global_labels
+    global global_env, global_labels, global_reward_horizon
+    global_reward_horizon = reward_horizon
     rs = reward_shaping or {}
     global_env = LOBTradingEnv(
         X_data,
@@ -214,8 +252,8 @@ def rollout_worker(args):
     actions = np.array(actions, dtype=np.int64)
     rewards = np.array(rewards, dtype=np.float32)
     
-    # Fast vectorized Return-To-Go calculation
-    returns_to_go = np.flip(np.cumsum(np.flip(rewards))).astype(np.float32)
+    # Compute return-to-go with an optional bounded horizon
+    returns_to_go = compute_rtg(rewards, global_reward_horizon)
     
     # Return standard Python/NumPy objects to avoid PyTorch shared memory leaks
     return {
@@ -244,16 +282,18 @@ def generate_dataset(
     reward_shaping=None,
     state_representation="raw",
     price_offset=10.0,
+    reward_horizon=None,
 ):
     """
     Distributes the generation of trajectories across all CPU cores.
     Converts the returned NumPy arrays into PyTorch tensors safely in the main process.
     """
+    horizon_str = str(reward_horizon) if reward_horizon else "full episode"
     print(f"\n--- Starting {desc} Generation ---")
     print(f"Data shape: {X.shape} | Episodes: {num_episodes} | Workers: {num_workers}")
     print(
         f"Reward: {reward_type} | state={state_representation} | "
-        f"window={window_size} len={episode_length}"
+        f"window={window_size} len={episode_length} | RTG horizon={horizon_str}"
     )
     
     # Create job list (assigning equal number of episodes to each policy)
@@ -281,6 +321,7 @@ def generate_dataset(
             reward_shaping,
             state_representation,
             price_offset,
+            reward_horizon,
         ),
     ) as pool:
         
@@ -329,6 +370,7 @@ def generate_dataset_pipeline(
     reward_shaping: dict | None = None,
     state_representation: str = "raw",
     price_offset: float = 10.0,
+    reward_horizon: int | None = None,
 ):
     """Encapsulated entry point for Hydra orchestrator."""
     # 1. Download Dataset via kagglehub
@@ -360,6 +402,7 @@ def generate_dataset_pipeline(
         reward_shaping=reward_shaping,
         state_representation=state_representation,
         price_offset=price_offset,
+        reward_horizon=reward_horizon,
     )
     
     # Generate Train plots
@@ -388,6 +431,7 @@ def generate_dataset_pipeline(
         reward_shaping=reward_shaping,
         state_representation=state_representation,
         price_offset=price_offset,
+        reward_horizon=reward_horizon,
     )
     
     # Generate Test plots

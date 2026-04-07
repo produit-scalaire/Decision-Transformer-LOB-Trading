@@ -14,7 +14,7 @@ from src.models.decision_transformer import DecisionTransformer
 from src.models.cnn_decision_transformer import CNNDecisionTransformer, CNNStateEncoder
 from src.models.model_factory import build_model, SUPPORTED_ARCHITECTURES
 from src.training.training_pipeline import OptimizedTrajectoryDataset, configure_optimizers
-from src.data.trajectories_generator import rollout_worker, init_worker
+from src.data.trajectories_generator import rollout_worker, init_worker, compute_rtg
 from src.evaluations.direction_metrics import oracle_actions_from_returns, compute_directional_f1
 
 # =============================================================================
@@ -722,3 +722,113 @@ def test_training_pipeline_builds_cnn_from_config(dummy_trajectories_file: str):
         )
 
     assert logits.shape == (1, 100, 3), f"Unexpected output shape: {logits.shape}"
+
+
+# =============================================================================
+# RETURN-TO-GO HORIZON TESTS
+# =============================================================================
+
+def test_compute_rtg_full_horizon_matches_reverse_cumsum():
+    """
+    With horizon=None, compute_rtg must equal the original reverse-cumsum formula.
+    The two implementations should produce bit-identical float32 results.
+    """
+    np.random.seed(0)
+    rewards = np.random.randn(50).astype(np.float32)
+
+    # Original formula used before this feature was added
+    expected = np.flip(np.cumsum(np.flip(rewards))).astype(np.float32)
+    result = compute_rtg(rewards, horizon=None)
+
+    np.testing.assert_array_almost_equal(
+        result, expected, decimal=5,
+        err_msg="Full-horizon RTG does not match the original reverse-cumsum formula."
+    )
+
+
+def test_compute_rtg_horizon_zero_treated_as_full():
+    """
+    horizon=0 is treated the same as horizon=None (full episode sum).
+    This keeps the interface forgiving for default/sentinel values.
+    """
+    rewards = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    full = compute_rtg(rewards, horizon=None)
+    zero = compute_rtg(rewards, horizon=0)
+    np.testing.assert_array_equal(full, zero)
+
+
+def test_compute_rtg_horizon_one_equals_reward_itself():
+    """
+    With H=1 each R̂_t is just r_t (only the current step's reward counts).
+    """
+    rewards = np.array([1.0, -2.0, 0.5, 3.0], dtype=np.float32)
+    result = compute_rtg(rewards, horizon=1)
+    np.testing.assert_array_almost_equal(result, rewards, decimal=6)
+
+
+def test_compute_rtg_bounded_horizon_hand_example():
+    """
+    Manual check: rewards=[1, 2, 3, 4, 5], H=2
+    t=0: r_0+r_1 = 3
+    t=1: r_1+r_2 = 5
+    t=2: r_2+r_3 = 7
+    t=3: r_3+r_4 = 9
+    t=4: r_4      = 5  (only one step left, window clamps to episode end)
+    """
+    rewards = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+    expected = np.array([3.0, 5.0, 7.0, 9.0, 5.0], dtype=np.float32)
+    result = compute_rtg(rewards, horizon=2)
+    np.testing.assert_array_almost_equal(result, expected, decimal=6)
+
+
+def test_compute_rtg_horizon_larger_than_episode_equals_full():
+    """
+    When H >= T (episode length), the result must equal the full-horizon RTG.
+    No out-of-bounds access should occur.
+    """
+    rewards = np.array([0.5, -0.1, 0.3], dtype=np.float32)
+    full = compute_rtg(rewards, horizon=None)
+    large = compute_rtg(rewards, horizon=1000)
+    np.testing.assert_array_almost_equal(full, large, decimal=6)
+
+
+def test_compute_rtg_output_dtype_is_float32():
+    """RTG array must always come back as float32 regardless of input dtype."""
+    rewards_f64 = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+    for h in (None, 1, 2):
+        result = compute_rtg(rewards_f64, horizon=h)
+        assert result.dtype == np.float32, f"Expected float32, got {result.dtype} for horizon={h}"
+
+
+def test_compute_rtg_first_element_is_total_return_when_full_horizon():
+    """
+    The first element of the full-horizon RTG is the episode total return.
+    This is the target_rtg used at inference time.
+    """
+    rewards = np.array([1.0, -0.5, 2.0, 0.3], dtype=np.float32)
+    rtg = compute_rtg(rewards, horizon=None)
+    assert rtg[0] == pytest.approx(float(rewards.sum()), rel=1e-5)
+
+
+def test_rollout_worker_uses_horizon_via_global(dummy_lob_data: np.ndarray):
+    """
+    When init_worker is called with reward_horizon=H, rollout_worker must produce
+    RTG values consistent with compute_rtg(..., horizon=H).
+
+    We use H=5 and verify that each R̂_t == sum of the next 5 rewards (clamped).
+    """
+    dummy_labels = np.zeros((500, 5), dtype=np.float32)
+    dummy_labels[:, 3] = 2  # label column used by label_mom policy
+
+    H = 5
+    init_worker(dummy_lob_data, dummy_labels, window_size=10, episode_length=50, reward_horizon=H)
+    traj = rollout_worker(("random", 99))
+
+    rewards = traj["rewards"]           # shape (T,)
+    rtg_worker = traj["rtg"].squeeze()  # shape (T,)  [squeezed from (T, 1)]
+
+    expected_rtg = compute_rtg(rewards, horizon=H)
+    np.testing.assert_array_almost_equal(
+        rtg_worker, expected_rtg, decimal=5,
+        err_msg="Worker RTG does not match compute_rtg with the same horizon."
+    )

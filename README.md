@@ -57,7 +57,16 @@ The causal transformer operates on context windows of length $K$:
 
 $$\tau = (\hat{R}_1, s_1, a_1, \hat{R}_2, s_2, a_2, \dots, \hat{R}_K, s_K, a_K)$$
 
-where $\hat{R}_{t} = \sum_{t'=t}^{T} r_{t'}$ is the **Return-to-Go**.
+where $\hat{R}_{t}$ is the **Return-to-Go**, computed with a configurable horizon $H$:
+
+$$\hat{R}_t = \sum_{t'=t}^{\min(t+H,\, T)-1} r_{t'}$$
+
+| `generator.reward_horizon` | Behaviour |
+|----------------------------|-----------|
+| `null` (default) | Sum all rewards from $t$ to the episode end $T$ (original DT paper) |
+| positive integer $H$ | Sum only the next $H$ steps; rewards further than $H$ steps ahead are excluded |
+
+A short horizon focuses the agent on near-term outcomes and can reduce the variance of RTG estimates in long episodes. See [Configuring the RTG horizon](#configuring-the-rtg-horizon) below.
 
 ## Pipeline Architecture & Execution
 
@@ -205,6 +214,31 @@ python main.py generator.state_representation=log_returns
 python main.py pipeline.run_generation=false pipeline.run_training=false 'evaluation.target_rtgs=[0.5, 1.0, 3.0, 5.0]'
 ```
 
+### Configuring the RTG horizon
+
+By default `generator.reward_horizon: null` (from `configs/config.yaml`) uses the full episode length to compute $\hat{R}_t$. Set it to a positive integer to cap the look-ahead window.
+
+**In `configs/config.yaml`:**
+
+```yaml
+generator:
+  reward_horizon: 200   # only sum the next 200 reward steps
+```
+
+**Via Hydra CLI override** (regenerate data only, keep existing model):
+
+```bash
+# Short horizon of 50 steps
+python main.py pipeline.run_training=false pipeline.run_evaluation=false \
+  generator.reward_horizon=50
+
+# Restore to full-episode RTG (null must be passed as a string)
+python main.py pipeline.run_training=false pipeline.run_evaluation=false \
+  generator.reward_horizon=null
+```
+
+> **Important:** the horizon only affects data generation (the stored `.pt` files). A model trained on data generated with `reward_horizon=50` conditions on short-horizon RTGs, so you must pass comparable target-RTG values at evaluation time. Changing this setting after training requires regenerating the dataset and retraining from scratch.
+
 **Context horizon sweep (train one checkpoint per $K$, then profile):** use a separate `paths.model_dir` per context length so `dt_model_final.pt` files are not overwritten, then aggregate:
 
 ```bash
@@ -261,7 +295,7 @@ The project root must be the current working directory so imports resolve (`src.
 - [x] **Context Horizon Profiling:** Benchmark Sharpe ratio and macro-F1 (vs instantaneous mid-proxy oracle) across attention windows $K \in \{50, 100, 250, 500\}$ via per-$K$ training checkpoints and `scripts/context_horizon_profile.py`. DeepLOB (Zhang et al., 2018) FI-2010 movement F1 at horizons $k \in \{10,50,100\}$ is cited in the script plot as a qualitative reference only (different dataset and label definition).
 - [ ] **Architectural Scaling:** Conduct ablation studies on the transformer depth and width (`d_model`, `n_heads`, `n_layers`) relative to the available 32GB VRAM.
 - [x] **CNN architecture:** A CNN-based state encoder (`CNNDecisionTransformer`) is available as a drop-in replacement for the base transformer. A `model.architecture` config key switches between the two paths at runtime. See [Model Architectures](#model-architectures) below for details.
-- [ ] **Return-to-go horizon ($T$):** Make the horizon $T$ in the future-reward sum $\hat{R}_t = \sum_{t'=t}^{T} r_{t'}$ configurable or otherwise modifiable (decoupled from raw episode length where appropriate).
+- [x] **Return-to-go horizon ($H$):** `generator.reward_horizon` in `configs/config.yaml` caps the future-reward sum: `null` keeps the original full-episode behaviour; a positive integer $H$ restricts the sum to the next $H$ steps. Implemented via `compute_rtg()` in `src/data/trajectories_generator.py`, threaded through `init_worker` / `rollout_worker` / `generate_dataset` / `generate_dataset_pipeline` / `main.py`; covered by tests in `tests/test.py`.
 
 ### Dataset & Environment Expansion
 
