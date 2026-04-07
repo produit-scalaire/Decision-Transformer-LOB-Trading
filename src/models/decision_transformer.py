@@ -84,9 +84,23 @@ class DecisionTransformer(nn.Module):
         self.d_model = d_model
         
         self.embed_timestep = nn.Embedding(max_timestep, d_model)
-        self.embed_rtg = nn.Linear(1, d_model, bias=False)
-        self.embed_state = nn.Linear(state_dim, d_model, bias=False)
-        self.embed_action = nn.Embedding(act_dim, d_model)
+
+        # Per-modality LayerNorm equalises embedding scales across RTG (1D),
+        # state (state_dim-D), and action modalities — Section 3 of
+        # Chen et al. (2021, arXiv:2106.01345).  Without it, the high-dim
+        # state projection dominates attention and RTG conditioning is lost.
+        self.embed_rtg = nn.Sequential(
+            nn.Linear(1, d_model, bias=False),
+            nn.LayerNorm(d_model),
+        )
+        self.embed_state = nn.Sequential(
+            nn.Linear(state_dim, d_model, bias=False),
+            nn.LayerNorm(d_model),
+        )
+        self.embed_action = nn.Sequential(
+            nn.Embedding(act_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
 
         self.blocks = nn.ModuleList([
             OptimizedTransformerBlock(d_model, n_heads, dropout)

@@ -81,7 +81,8 @@ def main(cfg: DictConfig) -> None:
             model_dir=cfg.paths.model_dir,
             model_cfg=cfg.model,
             train_cfg=cfg.training,
-            hardware_cfg=cfg.hardware
+            hardware_cfg=cfg.hardware,
+            plot_dir=cfg.paths.plot_dir,
         )
     else:
         log.info("Skipping Training Phase.")
@@ -92,7 +93,10 @@ def main(cfg: DictConfig) -> None:
     if cfg.pipeline.run_evaluation:
         log.info("Starting Evaluation Phase...")
         # Evaluate the latest saved checkpoint
-        latest_model = f"{cfg.paths.model_dir}/dt_model_final.pt" 
+        latest_model = f"{cfg.paths.model_dir}/dt_model_final.pt"
+        reward_shaping_eval = OmegaConf.to_container(
+            cfg.generator.reward_shaping, resolve=True
+        )
         evaluate_model(
             model_path=latest_model,
             data_path=cfg.paths.test_data,
@@ -100,6 +104,11 @@ def main(cfg: DictConfig) -> None:
             model_cfg=cfg.model,
             plot_dir=cfg.paths.plot_dir,
             state_representation=cfg.generator.state_representation,
+            train_data_path=cfg.paths.train_data,
+            generator_window_size=int(cfg.generator.window_size),
+            generator_price_offset=float(cfg.generator.price_offset),
+            generator_reward_type=str(cfg.generator.reward_type),
+            generator_reward_shaping=reward_shaping_eval,
         )
     else:
         log.info("Skipping Evaluation Phase.")

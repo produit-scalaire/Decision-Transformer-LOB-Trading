@@ -832,3 +832,484 @@ def test_rollout_worker_uses_horizon_via_global(dummy_lob_data: np.ndarray):
         rtg_worker, expected_rtg, decimal=5,
         err_msg="Worker RTG does not match compute_rtg with the same horizon."
     )
+
+
+# =============================================================================
+# FINANCIAL METRICS TESTS
+# =============================================================================
+
+from src.evaluations.financial_metrics import (
+    compute_sortino_ratio,
+    compute_var,
+    compute_cvar,
+    compute_var_cvar,
+    compute_max_drawdown,
+    compute_calmar_ratio,
+    compute_hit_ratio,
+    compute_profit_factor,
+    compute_advanced_metrics,
+    compute_batch_advanced_metrics,
+)
+
+
+class TestSortinoRatio:
+    def test_zero_downside_returns_high_sortino(self):
+        """All-positive rewards → sigma_d ≈ 0 → very large Sortino."""
+        rewards = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        sortino = compute_sortino_ratio(rewards, tau=0.0)
+        assert sortino > 10.0, f"Expected high Sortino for all-positive returns, got {sortino}"
+
+    def test_negative_only_rewards_low_sortino(self):
+        """All-negative rewards below tau → Sortino < 0."""
+        rewards = np.array([-0.1, -0.2, -0.3], dtype=np.float32)
+        sortino = compute_sortino_ratio(rewards, tau=0.0)
+        assert sortino < 0.0
+
+    def test_all_positive_rewards_higher_sortino_than_sharpe(self):
+        """For all-positive rewards the Sortino denominator sigma_d=0, making it
+        much larger than Sharpe (which has a non-zero std denominator)."""
+        rewards = np.array([0.1, 0.2, 0.15, 0.12, 0.08], dtype=np.float32)
+        mean_r = float(np.mean(rewards))
+        std_r = float(np.std(rewards)) + 1e-8
+        sharpe = mean_r / std_r
+        sortino = compute_sortino_ratio(rewards, tau=0.0)
+        # sigma_d = 0 so sortino >> sharpe for all-positive rewards
+        assert sortino > sharpe
+
+    def test_tau_shifts_baseline(self):
+        """Increasing tau reduces the Sortino ratio."""
+        rewards = np.array([0.05] * 20, dtype=np.float32)
+        s0 = compute_sortino_ratio(rewards, tau=0.0)
+        s1 = compute_sortino_ratio(rewards, tau=0.03)
+        assert s0 >= s1, "Higher tau should not increase Sortino"
+
+    def test_output_is_scalar_float(self):
+        rewards = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+        result = compute_sortino_ratio(rewards)
+        assert isinstance(result, float)
+
+
+class TestVaRCVaR:
+    def test_var_quantile_correctness(self):
+        """VaR_0.9 on uniform losses [0,1] should be close to 0.9."""
+        np.random.seed(42)
+        losses = np.random.uniform(0, 1, 100_000).astype(np.float32)
+        rewards = -losses
+        var = compute_var(rewards, alpha=0.9)
+        assert abs(var - 0.9) < 0.02, f"VaR_0.9 should be ~0.9, got {var}"
+
+    def test_cvar_exceeds_var(self):
+        """CVaR must be >= VaR for the same alpha (tail average >= quantile)."""
+        np.random.seed(1)
+        rewards = np.random.randn(5000).astype(np.float32)
+        for alpha in (0.9, 0.95, 0.99):
+            var = compute_var(rewards, alpha)
+            cvar = compute_cvar(rewards, alpha)
+            assert cvar >= var - 1e-6, f"CVaR < VaR at alpha={alpha}"
+
+    def test_var_cvar_tuple_consistency(self):
+        """compute_var_cvar must return the same values as individual calls."""
+        np.random.seed(2)
+        rewards = np.random.randn(1000).astype(np.float32)
+        var_t, cvar_t = compute_var_cvar(rewards, alpha=0.95)
+        assert abs(var_t - compute_var(rewards, 0.95)) < 1e-6
+        assert abs(cvar_t - compute_cvar(rewards, 0.95)) < 1e-6
+
+    def test_all_positive_rewards_var_negative(self):
+        """All-positive rewards → losses all negative → VaR < 0 (gain scenario)."""
+        rewards = np.array([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
+        var = compute_var(rewards, alpha=0.95)
+        assert var < 0.0
+
+    def test_cvar_99_ge_cvar_95(self):
+        """CVaR_99 should be >= CVaR_95 (higher confidence = worse tail)."""
+        np.random.seed(3)
+        rewards = np.random.randn(5000).astype(np.float32)
+        _, cvar95 = compute_var_cvar(rewards, 0.95)
+        _, cvar99 = compute_var_cvar(rewards, 0.99)
+        assert cvar99 >= cvar95 - 1e-6
+
+
+class TestMaxDrawdownCalmar:
+    def test_monotone_gains_zero_mdd(self):
+        """Strictly increasing PnL has zero drawdown."""
+        rewards = np.array([0.1, 0.1, 0.1, 0.1], dtype=np.float32)
+        mdd = compute_max_drawdown(rewards)
+        assert mdd == pytest.approx(0.0, abs=1e-7)
+
+    def test_known_drawdown_sequence(self):
+        """Rewards: [1, -2, 1] → PnL: [1, -1, 0] → peak=1, trough=-1 → MDD=2."""
+        rewards = np.array([1.0, -2.0, 1.0], dtype=np.float32)
+        mdd = compute_max_drawdown(rewards)
+        assert mdd == pytest.approx(2.0, abs=1e-6)
+
+    def test_mdd_nonnegative(self):
+        np.random.seed(10)
+        rewards = np.random.randn(200).astype(np.float32)
+        assert compute_max_drawdown(rewards) >= 0.0
+
+    def test_calmar_positive_when_net_positive(self):
+        """Net-positive trajectory with some drawdown → Calmar > 0."""
+        rewards = np.array([0.1, -0.05, 0.2, -0.03, 0.15], dtype=np.float32)
+        calmar = compute_calmar_ratio(rewards)
+        assert calmar > 0.0
+
+    def test_calmar_negative_when_net_negative(self):
+        """Net-negative trajectory → Calmar < 0."""
+        rewards = np.array([-0.1, 0.02, -0.15], dtype=np.float32)
+        calmar = compute_calmar_ratio(rewards)
+        assert calmar < 0.0
+
+
+class TestProfitFactorHitRatio:
+    def test_all_wins_hit_ratio_one(self):
+        rewards = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+        assert compute_hit_ratio(rewards) == pytest.approx(1.0)
+
+    def test_all_losses_hit_ratio_zero(self):
+        rewards = np.array([-0.1, -0.2, -0.3], dtype=np.float32)
+        assert compute_hit_ratio(rewards) == pytest.approx(0.0)
+
+    def test_hit_ratio_partial(self):
+        """3 wins out of 5 steps → hit ratio = 0.6."""
+        rewards = np.array([0.1, -0.2, 0.3, -0.1, 0.05], dtype=np.float32)
+        hr = compute_hit_ratio(rewards)
+        assert hr == pytest.approx(0.6, abs=1e-6)
+
+    def test_profit_factor_greater_than_one_for_net_positive(self):
+        """Gross profit > gross loss → PF > 1."""
+        rewards = np.array([2.0, -0.5, 1.0, -0.3], dtype=np.float32)
+        pf = compute_profit_factor(rewards)
+        assert pf > 1.0
+
+    def test_profit_factor_less_than_one_for_net_negative(self):
+        """Gross loss > gross profit → PF < 1."""
+        rewards = np.array([-2.0, 0.3, -1.5, 0.1], dtype=np.float32)
+        pf = compute_profit_factor(rewards)
+        assert pf < 1.0
+
+    def test_profit_factor_all_wins_very_large(self):
+        """All positive → denominator ≈ 0 → PF is very large."""
+        rewards = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+        pf = compute_profit_factor(rewards)
+        assert pf > 1e6
+
+
+class TestAdvancedMetrics:
+    def test_compute_advanced_metrics_returns_all_keys(self):
+        """compute_advanced_metrics must return all expected keys."""
+        rewards = np.random.randn(100).astype(np.float32)
+        result = compute_advanced_metrics(rewards)
+        expected_keys = {
+            "Sortino", "VaR_95", "CVaR_95", "VaR_99", "CVaR_99",
+            "MaxDD", "Calmar", "ProfitFactor", "HitRatio",
+        }
+        assert expected_keys == set(result.keys())
+
+    def test_compute_advanced_metrics_all_floats(self):
+        rewards = np.random.randn(50).astype(np.float32)
+        result = compute_advanced_metrics(rewards)
+        for k, v in result.items():
+            assert isinstance(v, float), f"Key {k} is not a float: {type(v)}"
+
+    def test_compute_batch_advanced_metrics_numpy(self):
+        """batch helper works with plain numpy (B, T) array."""
+        rewards = np.random.randn(4, 200).astype(np.float32)
+        result = compute_batch_advanced_metrics(rewards)
+        assert "Sortino" in result
+        assert "CVaR_99" in result
+        assert isinstance(result["HitRatio"], float)
+
+    def test_compute_batch_advanced_metrics_torch(self):
+        """batch helper works with PyTorch (B, T) tensor."""
+        rewards = torch.randn(4, 200)
+        result = compute_batch_advanced_metrics(rewards)
+        assert "ProfitFactor" in result
+        assert 0.0 <= result["HitRatio"] <= 1.0
+
+    def test_cvar_99_ge_cvar_95_batch(self):
+        """Batch CVaR_99 must be >= CVaR_95 on average."""
+        np.random.seed(42)
+        rewards = np.random.randn(8, 500).astype(np.float32)
+        result = compute_batch_advanced_metrics(rewards)
+        assert result["CVaR_99"] >= result["CVaR_95"] - 1e-5
+
+    def test_hit_ratio_in_unit_interval(self):
+        rewards = np.random.randn(10, 100).astype(np.float32)
+        result = compute_batch_advanced_metrics(rewards)
+        assert 0.0 <= result["HitRatio"] <= 1.0
+
+    def test_mdd_nonnegative_batch(self):
+        rewards = np.random.randn(5, 300).astype(np.float32)
+        result = compute_batch_advanced_metrics(rewards)
+        assert result["MaxDD"] >= 0.0
+
+
+# =============================================================================
+# TRAINING CURVE PLOTTING TESTS
+# =============================================================================
+
+from src.training.training_pipeline import plot_training_curves
+
+
+class TestPlotTrainingCurves:
+    def test_creates_png_file(self, tmp_path):
+        """plot_training_curves saves a valid PNG to the given path."""
+        history = {
+            "step_loss":  [(100, 1.2), (200, 1.0), (300, 0.9)],
+            "step_lr":    [(100, 1e-4), (200, 9e-5), (300, 8e-5)],
+            "epoch_loss": [(300, 1.0)],
+            "epoch_acc":  [(1, 0.55)],
+        }
+        save_path = tmp_path / "curves.png"
+        plot_training_curves(history, save_path)
+        assert save_path.exists(), "training_curves PNG was not created."
+        assert save_path.stat().st_size > 0, "training_curves PNG is empty."
+
+    def test_empty_history_does_not_raise(self, tmp_path):
+        """Calling with empty history must not crash (panels stay blank)."""
+        history = {"step_loss": [], "step_lr": [], "epoch_loss": [], "epoch_acc": []}
+        save_path = tmp_path / "curves_empty.png"
+        plot_training_curves(history, save_path)
+        assert save_path.exists()
+
+    def test_multi_epoch_history(self, tmp_path):
+        """Multiple epochs of data plot without error."""
+        history = {
+            "step_loss":  [(i * 50, 2.0 / (1 + i * 0.1)) for i in range(1, 21)],
+            "step_lr":    [(i * 50, 1e-4 * (0.99 ** i)) for i in range(1, 21)],
+            "epoch_loss": [(i * 100, 1.5 / (1 + i * 0.2)) for i in range(1, 6)],
+            "epoch_acc":  [(i, 0.3 + i * 0.08) for i in range(1, 6)],
+        }
+        save_path = tmp_path / "curves_multi.png"
+        plot_training_curves(history, save_path)
+        assert save_path.exists()
+
+
+# =============================================================================
+# DATASET VISUALISATION TESTS
+# =============================================================================
+
+from src.data.trajectories_generator import (
+    plot_lob_features,
+    plot_episode_cumulative_pnl,
+    plot_distributions,
+    detect_stock_boundaries,
+    split_by_stock,
+    POLICIES,
+)
+
+
+@pytest.fixture
+def dummy_x_data() -> np.ndarray:
+    """Minimal synthetic LOB matrix (T=200, 40 features) for viz tests."""
+    np.random.seed(55)
+    X = np.random.randn(200, 40).astype(np.float32)
+    X[:, 0] = np.abs(X[:, 0]) + 100.0   # ask1 > 0
+    X[:, 2] = X[:, 0] - 0.05             # bid1 < ask1
+    return X
+
+
+@pytest.fixture
+def dummy_trajectories_for_viz() -> list:
+    """Small synthetic trajectory list covering all 6 policies."""
+    np.random.seed(77)
+    trajectories = []
+    for policy in POLICIES:
+        T = 60
+        traj = {
+            "states":       torch.randn(T, 41, dtype=torch.float32),
+            "actions":      torch.randint(0, 3, (T,), dtype=torch.long),
+            "rewards":      torch.randn(T, dtype=torch.float32) * 0.01,
+            "rtg":          torch.randn(T, 1, dtype=torch.float32),
+            "timesteps":    torch.arange(T, dtype=torch.long),
+            "policy":       policy,
+            "total_return": float(torch.randn(1).item()),
+        }
+        trajectories.append(traj)
+    return trajectories
+
+
+class TestPlotLobFeatures:
+    def test_creates_all_three_png_files(self, tmp_path, dummy_x_data):
+        """plot_lob_features must create three PNG files."""
+        plot_lob_features(dummy_x_data, "Test", str(tmp_path))
+        expected = [
+            "test_lob_price_series.png",
+            "test_lob_feature_distributions.png",
+            "test_lob_autocorrelation.png",
+        ]
+        for fname in expected:
+            fpath = tmp_path / fname
+            assert fpath.exists(), f"Expected file not created: {fname}"
+            assert fpath.stat().st_size > 0, f"File is empty: {fname}"
+
+    def test_name_prefix_lower_cased(self, tmp_path, dummy_x_data):
+        """File names must use the lowercase of the name argument."""
+        plot_lob_features(dummy_x_data, "Train", str(tmp_path))
+        assert (tmp_path / "train_lob_price_series.png").exists()
+
+
+class TestPlotEpisodeCumulativePnL:
+    def test_creates_png_file(self, tmp_path, dummy_trajectories_for_viz):
+        plot_episode_cumulative_pnl(
+            dummy_trajectories_for_viz, "Train", str(tmp_path)
+        )
+        assert (tmp_path / "train_episode_pnl_examples.png").exists()
+
+    def test_handles_empty_trajectories_gracefully(self, tmp_path):
+        """Empty list must not crash, even if no file is produced."""
+        try:
+            plot_episode_cumulative_pnl([], "Test", str(tmp_path))
+        except Exception as exc:
+            pytest.fail(f"plot_episode_cumulative_pnl raised {exc!r} on empty input")
+
+
+class TestPlotDistributions:
+    def test_creates_all_expected_files(self, tmp_path, dummy_trajectories_for_viz):
+        plot_distributions(dummy_trajectories_for_viz, "Train", str(tmp_path))
+        expected_files = [
+            "train_policy_returns.png",
+            "train_rtg_distribution.png",
+            "train_action_distributions.png",
+            "train_episode_pnl_examples.png",
+        ]
+        for fname in expected_files:
+            fpath = tmp_path / fname
+            assert fpath.exists(), f"Expected file not found: {fname}"
+
+
+# =============================================================================
+# STOCK BOUNDARY DETECTION TESTS
+# =============================================================================
+
+def _make_multi_stock_lob(n_stocks: int = 3, events_per_stock: int = 200) -> np.ndarray:
+    """Synthetic concatenated LOB matrix mimicking FI-2010 multi-stock layout."""
+    segments = []
+    np.random.seed(42)
+    for s in range(n_stocks):
+        base_ask = 100.0 + s * 50.0
+        data = np.random.randn(events_per_stock, 40).astype(np.float32) * 0.01
+        data[:, 0] = base_ask + np.cumsum(np.random.randn(events_per_stock) * 0.001)
+        data[:, 2] = data[:, 0] - 0.05
+        segments.append(data)
+    return np.concatenate(segments, axis=0)
+
+
+class TestDetectStockBoundaries:
+    def test_detects_correct_number_of_boundaries(self):
+        X = _make_multi_stock_lob(n_stocks=5, events_per_stock=300)
+        boundaries = detect_stock_boundaries(X, n_stocks=5)
+        assert boundaries[0] == 0
+        assert boundaries[-1] == len(X)
+        assert len(boundaries) == 5 + 1
+
+    def test_single_stock_has_no_interior_boundaries(self):
+        X = _make_multi_stock_lob(n_stocks=1, events_per_stock=500)
+        boundaries = detect_stock_boundaries(X, n_stocks=1)
+        assert boundaries == [0, 500]
+
+    def test_boundary_positions_close_to_expected(self):
+        X = _make_multi_stock_lob(n_stocks=3, events_per_stock=200)
+        boundaries = detect_stock_boundaries(X, n_stocks=3)
+        assert abs(boundaries[1] - 200) <= 1
+        assert abs(boundaries[2] - 400) <= 1
+
+    def test_split_by_stock_returns_correct_count(self):
+        X = _make_multi_stock_lob(n_stocks=4, events_per_stock=150)
+        y = np.random.randn(len(X), 5).astype(np.float32)
+        segments = split_by_stock(X, y, n_stocks=4)
+        assert len(segments) == 4
+
+    def test_split_by_stock_preserves_total_rows(self):
+        X = _make_multi_stock_lob(n_stocks=3, events_per_stock=200)
+        segments = split_by_stock(X, n_stocks=3)
+        total = sum(len(sX) for sX, _ in segments)
+        assert total == len(X)
+
+    def test_split_by_stock_no_y(self):
+        X = _make_multi_stock_lob(n_stocks=2, events_per_stock=100)
+        segments = split_by_stock(X, n_stocks=2)
+        assert all(sy is None for _, sy in segments)
+
+
+# =============================================================================
+# DT_VIZ UNIT TESTS (new plots)
+# =============================================================================
+
+import pandas as pd
+from src.evaluations.dt_viz import (
+    compute_financial_metrics,
+    plot_drawdown_curves,
+    plot_action_distribution_by_rtg,
+    plot_advanced_metrics_comparison,
+    plot_inference_time,
+)
+
+
+class TestComputeFinancialMetrics:
+    def test_returns_all_required_keys(self):
+        """compute_financial_metrics must include PnL, Sharpe and all advanced keys."""
+        rewards = torch.randn(4, 200)
+        result = compute_financial_metrics(rewards)
+        required = {
+            "PnL", "Sharpe", "Sortino", "VaR_95", "CVaR_95",
+            "VaR_99", "CVaR_99", "MaxDD", "Calmar", "ProfitFactor", "HitRatio",
+        }
+        missing = required - set(result.keys())
+        assert not missing, f"Missing keys in compute_financial_metrics: {missing}"
+
+    def test_sharpe_positive_for_strictly_positive_rewards(self):
+        rewards = torch.ones(2, 50) * 0.01
+        m = compute_financial_metrics(rewards)
+        assert m["Sharpe"] > 0.0
+
+    def test_pnl_additive_sanity(self):
+        """PnL should equal sum of step rewards (averaged over batch)."""
+        rewards = torch.tensor([[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]], dtype=torch.float32)
+        m = compute_financial_metrics(rewards)
+        assert m["PnL"] == pytest.approx(0.6, abs=1e-5)
+
+
+class TestNewPlots:
+    def test_plot_drawdown_curves_creates_png(self, tmp_path):
+        rewards_dict = {
+            "Oracle": np.array([0.1, 0.1, -0.05, 0.1]),
+            "DT (R=0.5)": np.array([0.02, -0.01, 0.01, 0.02]),
+        }
+        save_path = tmp_path / "drawdown.png"
+        plot_drawdown_curves(rewards_dict, save_path)
+        assert save_path.exists()
+
+    def test_plot_action_distribution_by_rtg_creates_png(self, tmp_path):
+        actions = {
+            "R=0.0": np.array([0, 1, 2, 0, 0, 2, 1]),
+            "R=0.5": np.array([2, 2, 1, 0, 2, 2, 2]),
+        }
+        save_path = tmp_path / "action_dist.png"
+        plot_action_distribution_by_rtg(actions, save_path)
+        assert save_path.exists()
+
+    def test_plot_action_distribution_empty_does_not_crash(self, tmp_path):
+        save_path = tmp_path / "empty_action_dist.png"
+        plot_action_distribution_by_rtg({}, save_path)
+
+    def test_plot_advanced_metrics_comparison_creates_png(self, tmp_path):
+        data = {
+            "Oracle":     {"PnL": 0.5, "Sharpe": 1.2, "Sortino": 2.0, "CVaR_95": 0.01,
+                           "CVaR_99": 0.02, "MaxDD": 0.05, "Calmar": 5.0,
+                           "ProfitFactor": 2.5, "HitRatio": 0.65},
+            "DT (R=0.5)": {"PnL": 0.1, "Sharpe": 0.5, "Sortino": 0.8, "CVaR_95": 0.03,
+                           "CVaR_99": 0.05, "MaxDD": 0.1, "Calmar": 1.0,
+                           "ProfitFactor": 1.2, "HitRatio": 0.52},
+        }
+        df = pd.DataFrame.from_dict(data, orient="index")
+        save_path = tmp_path / "advanced.png"
+        plot_advanced_metrics_comparison(df, save_path)
+        assert save_path.exists()
+
+    def test_plot_inference_time_creates_png(self, tmp_path):
+        times = {"Oracle": 0.002, "DT (R=0.0)": 0.15, "DT (R=0.5)": 0.16}
+        save_path = tmp_path / "inference.png"
+        plot_inference_time(times, save_path)
+        assert save_path.exists()

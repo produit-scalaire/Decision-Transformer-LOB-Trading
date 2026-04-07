@@ -1,12 +1,16 @@
 import os
 import time
 import argparse
+from pathlib import Path
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset
 from src.models.model_factory import build_model
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
+
+plt.ioff()
 
 # -----------------------------------------------------------------------------
 # 1. Dataset Class (Optimized for Huge Datasets)
@@ -119,11 +123,80 @@ def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: f
     return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=True)
 
 # -----------------------------------------------------------------------------
-# 3. Training Loop
+# 3. Training Curve Plotting
 # -----------------------------------------------------------------------------
 
-def train_model(train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg):
-    """Encapsulated entry point for Hydra orchestrator."""
+def plot_training_curves(history: dict, save_path: "str | Path"):
+    """Save a 3-panel figure of Loss, Accuracy and Learning Rate over training.
+
+    Parameters
+    ----------
+    history   : dict with keys:
+                  ``step_loss``  — list of (global_step, loss) pairs
+                  ``step_lr``    — list of (global_step, lr) pairs
+                  ``epoch_acc``  — list of (epoch, accuracy) pairs
+    save_path : destination PNG path.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+
+    # --- Loss ---
+    if history.get("step_loss"):
+        steps, losses = zip(*history["step_loss"])
+        axes[0].plot(steps, losses, linewidth=1.0, color="tab:blue", alpha=0.85)
+        if history.get("epoch_loss"):
+            ep_steps, ep_losses = zip(*history["epoch_loss"])
+            axes[0].plot(
+                ep_steps, ep_losses, "o-", color="navy", linewidth=1.8,
+                markersize=5, label="Epoch avg"
+            )
+            axes[0].legend(fontsize=8)
+    axes[0].set_title("Training Loss", fontweight="bold")
+    axes[0].set_xlabel("Gradient Step")
+    axes[0].set_ylabel("Cross-Entropy Loss")
+    axes[0].grid(True, alpha=0.3)
+
+    # --- Accuracy ---
+    if history.get("epoch_acc"):
+        epochs, accs = zip(*history["epoch_acc"])
+        axes[1].plot(epochs, [a * 100 for a in accs], "o-", color="tab:green",
+                     linewidth=1.8, markersize=6)
+    axes[1].set_title("Training Accuracy", fontweight="bold")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy (%)")
+    axes[1].grid(True, alpha=0.3)
+
+    # --- Learning Rate ---
+    if history.get("step_lr"):
+        steps, lrs = zip(*history["step_lr"])
+        axes[2].plot(steps, lrs, linewidth=1.0, color="tab:orange")
+    axes[2].set_title("Learning Rate Schedule", fontweight="bold")
+    axes[2].set_xlabel("Gradient Step")
+    axes[2].set_ylabel("Learning Rate")
+    axes[2].ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    axes[2].grid(True, alpha=0.3)
+
+    plt.suptitle("Training Curves", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"Training curves saved to '{save_path}'.")
+
+
+# -----------------------------------------------------------------------------
+# 4. Training Loop
+# -----------------------------------------------------------------------------
+
+def train_model(
+    train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg,
+    plot_dir: "str | None" = None
+):
+    """Encapsulated entry point for Hydra orchestrator.
+
+    Parameters
+    ----------
+    plot_dir : Optional directory to save the training-curves PNG.
+               Falls back to ``model_dir`` when *None*.
+    """
     device = torch.device(hardware_cfg.device if torch.cuda.is_available() else 'cpu')
     print(f"--- Hardware target: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'} ---")
 
@@ -162,7 +235,17 @@ def train_model(train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg):
     print(f"Total gradient steps per epoch: {len(dataloader):,}")
     print("=" * 80)
 
-    # 6. Training Loop
+    # 6. Training history buffers (for learning-curve plots)
+    history: dict[str, list] = {
+        "step_loss":  [],   # (global_step, loss)
+        "step_lr":    [],   # (global_step, lr)
+        "epoch_loss": [],   # (global_step_at_epoch_end, avg_loss)
+        "epoch_acc":  [],   # (epoch, accuracy)
+    }
+    global_step = 0
+    log_every = max(1, len(dataloader) // 10)   # ~10 loss points per epoch
+
+    # 7. Training Loop
     for epoch in range(1, train_cfg.epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -171,31 +254,38 @@ def train_model(train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg):
         start_time = time.time()
 
         for step, (states, actions, rtg, timesteps) in enumerate(dataloader):
-            
+
             states = states.to(device, non_blocking=True)
             actions = actions.to(device, non_blocking=True)
             rtg = rtg.to(device, non_blocking=True)
             timesteps = timesteps.to(device, non_blocking=True)
-            
+
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 logits = model(states, actions, rtg, timesteps)
-                
+
                 flat_logits = logits.reshape(-1, logits.size(-1))
                 flat_actions = actions.reshape(-1)
-                
+
                 loss = loss_fn(flat_logits, flat_actions)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
+
             optimizer.step()
             scheduler.step()
+            global_step += 1
 
             batch_size_actual = actions.size(0)
             epoch_loss += loss.item() * batch_size_actual
             epoch_correct += (flat_logits.argmax(dim=-1) == flat_actions).sum().item()
             epoch_total += flat_actions.numel()
+
+            # Record step-level metrics at regular intervals
+            if global_step % log_every == 0:
+                current_lr = scheduler.get_last_lr()[0]
+                history["step_loss"].append((global_step, loss.item()))
+                history["step_lr"].append((global_step, current_lr))
 
             if (step + 1) % 500 == 0:
                 current_lr = scheduler.get_last_lr()[0]
@@ -206,12 +296,15 @@ def train_model(train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg):
         avg_acc = epoch_correct / epoch_total
         epoch_time = time.time() - start_time
         samples_per_sec = len(dataset) / epoch_time
-        
+
+        history["epoch_loss"].append((global_step, avg_loss))
+        history["epoch_acc"].append((epoch, avg_acc))
+
         print("-" * 80)
         print(f"Epoch {epoch:02d} Completed in {epoch_time:.1f}s | Throughput: {samples_per_sec:,.0f} windows/s")
         print(f"Average Loss: {avg_loss:.4f} | Accuracy: {avg_acc:.2%}")
         print("-" * 80)
-        
+
         # Save Checkpoint
         checkpoint_path = f"{model_dir}/dt_model_ep{epoch:02d}.pt"
         state_dict = {
@@ -224,6 +317,11 @@ def train_model(train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg):
         torch.save(state_dict, checkpoint_path)
         # Always save the latest as final to easily load it during evaluation
         torch.save(state_dict, f"{model_dir}/dt_model_final.pt")
+
+    # 8. Save training curves
+    curves_dir = Path(plot_dir) if plot_dir else Path(model_dir)
+    curves_dir.mkdir(parents=True, exist_ok=True)
+    plot_training_curves(history, curves_dir / "training_curves.png")
 
 
 def train(args):

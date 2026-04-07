@@ -36,6 +36,63 @@ global_reward_horizon = None  # None means sum to episode end (standard DT)
 
 
 # -----------------------------------------------------------------------------
+# FI-2010 MULTI-STOCK UTILITIES
+# -----------------------------------------------------------------------------
+
+def detect_stock_boundaries(
+    lob_data: np.ndarray, n_stocks: int = 5
+) -> list[int]:
+    """Detect stock boundaries in FI-2010 concatenated LOB data.
+
+    FI-2010 cross-fold files concatenate data from ``n_stocks`` Finnish
+    stocks along the time axis.  This function finds the ``n_stocks - 1``
+    largest absolute mid-price jumps, which correspond to the transitions
+    between different equities.
+
+    A top-K approach is used instead of a threshold because the z-scored
+    data has very small tick-to-tick differences, making any fixed or
+    median-relative threshold unreliable.
+
+    Returns a sorted list of boundary indices **including** 0 and
+    ``len(lob_data)`` so that ``zip(boundaries[:-1], boundaries[1:])``
+    yields per-stock slices.
+    """
+    if n_stocks < 2:
+        return [0, len(lob_data)]
+
+    mid = (lob_data[:, 0] + lob_data[:, 2]) / 2.0
+    abs_diff = np.abs(np.diff(mid))
+
+    n_boundaries = n_stocks - 1
+    if len(abs_diff) < n_boundaries:
+        return [0, len(lob_data)]
+
+    # Pick the n_boundaries largest jumps (stock transitions).
+    top_indices = np.argsort(abs_diff)[-n_boundaries:]
+    jump_indices = sorted((top_indices + 1).tolist())
+    return [0] + jump_indices + [len(lob_data)]
+
+
+def split_by_stock(
+    X_data: np.ndarray,
+    y_data: np.ndarray | None = None,
+    n_stocks: int = 5,
+) -> list[tuple[np.ndarray, np.ndarray | None]]:
+    """Split concatenated FI-2010 data into per-stock segments.
+
+    Returns a list of ``(X_stock, y_stock)`` pairs (``y_stock`` is *None*
+    when ``y_data`` is not provided).
+    """
+    boundaries = detect_stock_boundaries(X_data, n_stocks=n_stocks)
+    segments: list[tuple[np.ndarray, np.ndarray | None]] = []
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i + 1]
+        seg_y = y_data[start:end] if y_data is not None else None
+        segments.append((X_data[start:end], seg_y))
+    return segments
+
+
+# -----------------------------------------------------------------------------
 # RETURN-TO-GO COMPUTATION
 # -----------------------------------------------------------------------------
 def compute_rtg(rewards: np.ndarray, horizon: int | None) -> np.ndarray:
@@ -168,48 +225,254 @@ POLICIES = {
 # -----------------------------------------------------------------------------
 # PLOTTING FUNCTIONS
 # -----------------------------------------------------------------------------
-def plot_distributions(trajectories, dataset_name, save_dir="plots"):
-    """
-    Generates and saves the return distribution plots to provide visual feedback.
+
+def plot_lob_features(X_data: np.ndarray, name: str, save_dir: str = "plots"):
+    """Visualise raw LOB market data — mirrors the introduction notebook.
+
+    Three panels are saved as separate files:
+
+    1. ``{name}_lob_price_series.png``
+       Best ask, best bid and mid-price over the full time horizon.
+
+    2. ``{name}_lob_feature_distributions.png``
+       Histogram distributions of all 10 Level-1 features (ask/bid prices
+       and volumes across the 5 LOB levels).
+
+    3. ``{name}_lob_autocorrelation.png``
+       Autocorrelation function (ACF) of the mid-price first-difference
+       (i.e., tick-by-tick returns) up to 50 lags.
+
+    Parameters
+    ----------
+    X_data   : raw LOB array of shape (T, 40).
+    name     : dataset split label ("Train" or "Test").
+    save_dir : output directory.
     """
     Path(save_dir).mkdir(exist_ok=True, parents=True)
-    
-    policy_returns = {p: [] for p in POLICIES.keys()}
-    all_rtg = []
-    
+    name_l = name.lower()
+
+    # --- 1. Price series ---
+    ask1 = X_data[:, 0]
+    bid1 = X_data[:, 2]
+    mid  = (ask1 + bid1) / 2.0
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(ask1, label="Best Ask (L1)", linewidth=0.8, color="tab:red",   alpha=0.8)
+    ax.plot(bid1, label="Best Bid (L1)", linewidth=0.8, color="tab:green", alpha=0.8)
+    ax.plot(mid,  label="Mid Price",     linewidth=1.2, color="tab:blue",  alpha=0.9)
+    ax.set_title(f"{name} — Best Bid / Ask / Mid-Price over Time", fontweight="bold")
+    ax.set_xlabel("Tick")
+    ax.set_ylabel("Price")
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/{name_l}_lob_price_series.png", dpi=150)
+    plt.close()
+
+    # --- 2. Level-1 feature distributions ---
+    # LOB columns: (ask_p, ask_v, bid_p, bid_v) repeated for 5 levels → 20 pairs
+    level1_labels = [
+        "Ask P L1", "Ask V L1", "Bid P L1", "Bid V L1",
+        "Ask P L2", "Ask V L2", "Bid P L2", "Bid V L2",
+        "Ask P L3", "Ask V L3",
+    ]
+    fig, axes = plt.subplots(2, 5, figsize=(18, 6))
+    for i, (ax, label) in enumerate(zip(axes.ravel(), level1_labels)):
+        ax.hist(X_data[:, i], bins=50, color="tab:blue", alpha=0.7, edgecolor="black")
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("Value", fontsize=7)
+        ax.grid(True, alpha=0.25)
+    plt.suptitle(
+        f"{name} — Level-1 LOB Feature Distributions", fontsize=13, fontweight="bold"
+    )
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/{name_l}_lob_feature_distributions.png", dpi=150)
+    plt.close()
+
+    # --- 3. Mid-price autocorrelation ---
+    mid_returns = np.diff(mid)
+    max_lags = min(50, len(mid_returns) - 1)
+    acf_vals = np.array(
+        [np.corrcoef(mid_returns[: len(mid_returns) - lag],
+                     mid_returns[lag:])[0, 1]
+         for lag in range(1, max_lags + 1)]
+    )
+    conf = 1.96 / np.sqrt(len(mid_returns))
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    lags = np.arange(1, max_lags + 1)
+    ax.bar(lags, acf_vals, color="tab:blue", alpha=0.7)
+    ax.axhline( conf, color="red", linestyle="--", linewidth=1.0, label="95% CI")
+    ax.axhline(-conf, color="red", linestyle="--", linewidth=1.0)
+    ax.axhline(0, color="black", linewidth=0.6)
+    ax.set_title(
+        f"{name} — Autocorrelation of Mid-Price Returns (ACF)", fontweight="bold"
+    )
+    ax.set_xlabel("Lag")
+    ax.set_ylabel("Autocorrelation")
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/{name_l}_lob_autocorrelation.png", dpi=150)
+    plt.close()
+
+    print(f"LOB feature plots for {name} saved to '{save_dir}/'.")
+
+
+def plot_episode_cumulative_pnl(
+    trajectories: list, dataset_name: str, save_dir: str = "plots"
+):
+    """One example cumulative-PnL trajectory per policy — mirrors image 2 in
+    the introduction notebook.
+
+    Parameters
+    ----------
+    trajectories  : list of trajectory dicts (output of ``generate_dataset``).
+    dataset_name  : label ("Train" or "Test").
+    save_dir      : output directory.
+    """
+    Path(save_dir).mkdir(exist_ok=True, parents=True)
+
+    by_policy: dict[str, list] = {p: [] for p in POLICIES}
     for t in trajectories:
-        policy_returns[t["policy"]].append(t["total_return"])
-        # Extract RTG tensors to a flat list for global distribution
-        all_rtg.extend(t["rtg"].flatten().numpy())
-        
-    # 1. Episode returns distribution per policy
+        by_policy[t["policy"]].append(t)
+
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    axes = axes.flatten()
+    axes = axes.ravel()
+
+    for ax, policy in zip(axes, POLICIES.keys()):
+        pool = by_policy[policy]
+        if not pool:
+            ax.set_visible(False)
+            continue
+        example = pool[0]
+        rewards = example["rewards"]
+        if isinstance(rewards, torch.Tensor):
+            rewards = rewards.numpy()
+        cum_pnl = np.cumsum(rewards)
+        ax.plot(cum_pnl, linewidth=1.2, color="steelblue")
+        ax.axhline(0, color="black", linewidth=0.5)
+        ax.set_title(f"{policy} — example episode")
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Cumul. PnL")
+        ax.grid(True, alpha=0.25)
+
+    plt.suptitle(
+        f"Cumulative PnL per policy — {dataset_name}", fontsize=13, fontweight="bold"
+    )
+    plt.tight_layout()
+    plt.savefig(
+        f"{save_dir}/{dataset_name.lower()}_episode_pnl_examples.png", dpi=150
+    )
+    plt.close()
+    print(f"Episode PnL examples for {dataset_name} saved to '{save_dir}/'.")
+
+
+def plot_distributions(trajectories, dataset_name, save_dir="plots"):
+    """Generate and save distribution plots for a trajectory dataset.
+
+    Files produced
+    --------------
+    ``{dataset_name.lower()}_policy_returns.png``
+        Episode return histograms per policy.
+
+    ``{dataset_name.lower()}_rtg_distribution.png``
+        Global Return-to-Go distribution across all trajectories.
+
+    ``{dataset_name.lower()}_action_distributions.png``
+        Per-policy action (Short/Flat/Long) distribution bar charts.
+
+    ``{dataset_name.lower()}_episode_pnl_examples.png``
+        One example cumulative-PnL curve per policy.
+    """
+    Path(save_dir).mkdir(exist_ok=True, parents=True)
+
+    policy_returns: dict[str, list] = {p: [] for p in POLICIES.keys()}
+    policy_actions: dict[str, list] = {p: [] for p in POLICIES.keys()}
+    all_rtg: list[float] = []
+
+    for t in trajectories:
+        p = t["policy"]
+        policy_returns[p].append(t["total_return"])
+        actions = t["actions"]
+        if isinstance(actions, torch.Tensor):
+            policy_actions[p].extend(actions.tolist())
+        else:
+            policy_actions[p].extend(actions.tolist())
+        rtg_flat = t["rtg"]
+        if isinstance(rtg_flat, torch.Tensor):
+            all_rtg.extend(rtg_flat.flatten().tolist())
+        else:
+            all_rtg.extend(rtg_flat.flatten().tolist())
+
+    # 1. Episode return histograms per policy
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes = axes.ravel()
     for i, (policy, rets) in enumerate(policy_returns.items()):
+        ax = axes[i]
         if rets:
-            axes[i].hist(rets, bins=30, alpha=0.7, edgecolor='black', color='tab:blue')
-            axes[i].set_title(f"Policy: {policy}")
-            axes[i].axvline(np.mean(rets), color='red', linestyle='dashed', linewidth=1.5, label=f"Mean: {np.mean(rets):.2f}")
-            axes[i].legend()
-            
-    plt.suptitle(f"Return Distributions by Policy ({dataset_name})", fontsize=16, fontweight='bold')
+            ax.hist(rets, bins=30, alpha=0.7, edgecolor="black", color="tab:blue")
+            mean_v = np.mean(rets)
+            ax.axvline(
+                mean_v, color="red", linestyle="dashed", linewidth=1.5,
+                label=f"mean={mean_v:.4f}"
+            )
+            ax.legend(fontsize=8)
+        ax.set_title(f"{policy} policy")
+        ax.set_xlabel("Episode return")
+        ax.set_ylabel("Count")
+
+    plt.suptitle(
+        f"Distribution of episode returns per policy", fontsize=14, fontweight="bold"
+    )
     plt.tight_layout()
     plt.savefig(f"{save_dir}/{dataset_name.lower()}_policy_returns.png", dpi=150)
     plt.close()
 
-    # 2. Global Return-to-Go distribution
+    # 2. Global RTG distribution
+    all_rtg_arr = np.asarray(all_rtg, dtype=np.float32)
     plt.figure(figsize=(10, 5))
-    plt.hist(all_rtg, bins=100, alpha=0.75, color='tab:purple', edgecolor='black')
-    plt.title(f"Global Return-to-Go Distribution ({dataset_name})", fontweight='bold')
-    plt.xlabel("Return-to-Go")
-    plt.ylabel("Frequency")
-    plt.axvline(np.mean(all_rtg), color='red', linestyle='dashed', linewidth=2, label=f"Global Mean: {np.mean(all_rtg):.2f}")
+    plt.hist(all_rtg_arr, bins=100, alpha=0.75, color="tab:purple", edgecolor="black")
+    plt.title(
+        f"Distribution of return-to-go across all trajectories", fontweight="bold"
+    )
+    plt.xlabel("Return-to-go")
+    plt.ylabel("Count")
+    global_mean = float(all_rtg_arr.mean())
+    plt.axvline(
+        global_mean, color="red", linestyle="dashed", linewidth=2,
+        label=f"Global Mean: {global_mean:.4f}"
+    )
     plt.legend()
     plt.tight_layout()
     plt.savefig(f"{save_dir}/{dataset_name.lower()}_rtg_distribution.png", dpi=150)
     plt.close()
-    
-    print(f"Visual plots for {dataset_name} have been generated in the '{save_dir}/' directory.")
+
+    # 3. Per-policy action distributions
+    action_labels = ["Short", "Flat", "Long"]
+    action_colors = ["tab:red", "tab:gray", "tab:green"]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+    axes = axes.ravel()
+    for i, (policy, acts) in enumerate(policy_actions.items()):
+        ax = axes[i]
+        if acts:
+            acts_arr = np.asarray(acts, dtype=int)
+            counts = np.bincount(acts_arr, minlength=3)
+            ax.bar(action_labels, counts, color=action_colors)
+            ax.set_title(f"{policy} policy")
+            ax.set_ylabel("Count")
+            ax.grid(axis="y", alpha=0.3)
+    plt.suptitle(
+        f"Action Distribution per Policy — {dataset_name}", fontsize=14, fontweight="bold"
+    )
+    plt.tight_layout()
+    plt.savefig(f"{save_dir}/{dataset_name.lower()}_action_distributions.png", dpi=150)
+    plt.close()
+
+    # 4. Episode cumulative PnL examples per policy
+    plot_episode_cumulative_pnl(trajectories, dataset_name, save_dir)
+
+    print(f"Visual plots for {dataset_name} generated in '{save_dir}/'.")
 
 # -----------------------------------------------------------------------------
 # WORKER EXECUTION
@@ -344,19 +607,99 @@ def generate_dataset(
                 all_trajectories.append(torch_traj)
                 pbar.update()
 
-    # Save to disk
-    torch.save(all_trajectories, output_file)
-    print(f"Saved {len(all_trajectories)} trajectories to {output_file}")
-    
+    # Save to disk (skip when called in per-stock mode with output_file=None)
+    if output_file is not None:
+        torch.save(all_trajectories, output_file)
+        print(f"Saved {len(all_trajectories)} trajectories to {output_file}")
+
     # Print short summary
     returns = [t["total_return"] for t in all_trajectories]
     print(f"Metrics -> Mean Return: {np.mean(returns):.4f} | Max Return: {np.max(returns):.4f}\n")
-    
+
     return all_trajectories
 
 # -----------------------------------------------------------------------------
 # MAIN EXECUTION
 # -----------------------------------------------------------------------------
+def _generate_per_stock(
+    X_full: np.ndarray,
+    y_full: np.ndarray,
+    total_episodes: int,
+    output_file: str,
+    workers: int,
+    split_label: str,
+    plot_dir: str,
+    *,
+    window_size: int,
+    episode_length: int,
+    reward_type: str,
+    reward_shaping: dict | None,
+    state_representation: str,
+    price_offset: float,
+    reward_horizon: int | None,
+) -> list:
+    """Generate trajectories independently per stock, then combine.
+
+    FI-2010 fold files concatenate 5 stocks along the time axis.
+    Generating episodes from the concatenated array allows random windows
+    to cross stock boundaries — mid-price jumps discontinuously and rewards
+    become meaningless.  This helper splits the data first.
+    """
+    stocks = split_by_stock(X_full, y_full)
+    n_stocks = len(stocks)
+    total_events = sum(len(sX) for sX, _ in stocks)
+    print(
+        f"Detected {n_stocks} stocks in {split_label} data: "
+        f"{[len(sX) for sX, _ in stocks]} events each "
+        f"({total_events} total)"
+    )
+
+    # Visualise full concatenated LOB features (matches notebook)
+    plot_lob_features(X_full, split_label, plot_dir)
+
+    all_trajectories: list = []
+    allocated = 0
+    for stock_idx, (sX, sy) in enumerate(stocks):
+        if len(sX) <= window_size + episode_length:
+            print(
+                f"  Stock {stock_idx + 1}: only {len(sX)} events — "
+                f"too short for window={window_size}+episode={episode_length}, skipping."
+            )
+            continue
+
+        # Proportional episode allocation; last stock absorbs rounding remainder
+        if stock_idx < n_stocks - 1:
+            n_eps = max(len(POLICIES), round(total_episodes * len(sX) / total_events))
+        else:
+            n_eps = max(len(POLICIES), total_episodes - allocated)
+        allocated += n_eps
+
+        trajs = generate_dataset(
+            X=sX,
+            y=sy,
+            num_episodes=n_eps,
+            output_file=None,
+            num_workers=workers,
+            desc=f"{split_label} Stock {stock_idx + 1}/{n_stocks}",
+            window_size=window_size,
+            episode_length=episode_length,
+            reward_type=reward_type,
+            reward_shaping=reward_shaping,
+            state_representation=state_representation,
+            price_offset=price_offset,
+            reward_horizon=reward_horizon,
+        )
+        all_trajectories.extend(trajs)
+
+    # Save combined dataset
+    torch.save(all_trajectories, output_file)
+    print(f"Saved {len(all_trajectories)} trajectories to {output_file}")
+
+    # Distribution plots on the combined trajectories
+    plot_distributions(all_trajectories, split_label, plot_dir)
+    return all_trajectories
+
+
 def generate_dataset_pipeline(
     train_episodes: int,
     test_episodes: int,
@@ -377,25 +720,12 @@ def generate_dataset_pipeline(
     print("Downloading/Locating FI-2010 dataset...")
     import kagglehub
     dataset_path = Path(kagglehub.dataset_download("ulfricirons/fi-2010"))
-    
+
     # Locate Fold 9 files
     train_file = next(dataset_path.rglob("*NoAuction_Zscore*Training/Train*CF_9.txt"))
     test_file  = next(dataset_path.rglob("*NoAuction_Zscore*Testing/Test*CF_9.txt"))
-    
-    # 2. Load Train Data (Days 1-9)
-    print("Loading Train Data (Days 1-9)...")
-    train_raw = np.loadtxt(train_file)
-    X_train = train_raw[:40, :].T.astype(np.float32)  # Raw LOB only
-    y_train = train_raw[144:, :].T.astype(np.float32) # Labels
-    
-    # Generate Train Dataset
-    train_trajectories = generate_dataset(
-        X=X_train,
-        y=y_train,
-        num_episodes=train_episodes,
-        output_file=train_out,
-        num_workers=workers,
-        desc="Train Dataset",
+
+    gen_kwargs = dict(
         window_size=window_size,
         episode_length=episode_length,
         reward_type=reward_type,
@@ -404,39 +734,31 @@ def generate_dataset_pipeline(
         price_offset=price_offset,
         reward_horizon=reward_horizon,
     )
-    
-    # Generate Train plots
-    plot_distributions(train_trajectories, "Train", plot_dir)
-    
-    # Free up memory before loading test data
-    del train_raw, X_train, y_train, train_trajectories
-    
-    # 3. Load Test Data (Day 10)
+
+    # 2. Load & generate Train Data (Days 1-9)
+    print("Loading Train Data (Days 1-9)...")
+    train_raw = np.loadtxt(train_file)
+    X_train = train_raw[:40, :].T.astype(np.float32)
+    y_train = train_raw[144:, :].T.astype(np.float32)
+
+    _generate_per_stock(
+        X_train, y_train, train_episodes, train_out, workers,
+        split_label="Train", plot_dir=plot_dir, **gen_kwargs,
+    )
+    del train_raw, X_train, y_train
+
+    # 3. Load & generate Test Data (Day 10)
     print("Loading Test Data (Day 10)...")
     test_raw = np.loadtxt(test_file)
     X_test = test_raw[:40, :].T.astype(np.float32)
     y_test = test_raw[144:, :].T.astype(np.float32)
-    
-    # Generate Test Dataset
-    test_trajectories = generate_dataset(
-        X=X_test,
-        y=y_test,
-        num_episodes=test_episodes,
-        output_file=test_out,
-        num_workers=workers,
-        desc="Test Dataset",
-        window_size=window_size,
-        episode_length=episode_length,
-        reward_type=reward_type,
-        reward_shaping=reward_shaping,
-        state_representation=state_representation,
-        price_offset=price_offset,
-        reward_horizon=reward_horizon,
+
+    _generate_per_stock(
+        X_test, y_test, test_episodes, test_out, workers,
+        split_label="Test", plot_dir=plot_dir, **gen_kwargs,
     )
-    
-    # Generate Test plots
-    plot_distributions(test_trajectories, "Test", plot_dir)
-    
+    del test_raw, X_test, y_test
+
     print(f"All processes completed successfully. Outputs saved at {train_out} and {test_out}.")
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ pipeline:
 
 # Hardware specific settings (Optimized for Ryzen 9 9950X & RTX 5090)
 hardware:
-  workers: 10
+  workers: 6
   device: "cuda"
   compile_model: true  # Torch 2.x max-autotune
 
@@ -29,7 +29,7 @@ generator:
   episode_length: 2000
   # mid_price: PnL from mid changes only (default for DT / offline data).
   # shaped: same base PnL minus drawdown, rolling return variance, and |position| penalties.
-  reward_type: mid-price
+  reward_type: mid_price
   reward_shaping:
     drawdown_coef: 0.02
     variance_coef: 0.5
@@ -69,6 +69,20 @@ training:
 
 # Inference & Validation
 evaluation:
-  target_rtgs: [0.0, 0.2 ,0.5, 1.0, 2.0]
+  # RTG tokens during rollout:
+  #   autoregressive — R_{t+1} = R_t − r_t (if r_t≡0 ⇒ RTG frozen ⇒ often all-Flat).
+  #   anchored_offline — R_{b,t} = traj_rtg[b,t]·(target/traj_rtg[b,0]) when |ref₀|>ε; else additive offset.
+  rtg_rollout_mode: anchored_offline  # autoregressive | anchored_offline
+  # RTG at t=0 must match training scale (sum of episode rewards). Use train_percentiles
+  # so targets align with the offline dataset; manual values are often far too small.
+  rtg_source: train_percentiles  # manual | train_percentiles
+  # Manual fallback: values MUST match the RTG scale from training data.
+  # For 2000-step episodes on z-scored FI-2010 LOB, per-episode oracle
+  # return is typically ~0.1–0.6; values far above that are out-of-distribution
+  # and cause the model to degenerate to holding flat.
+  target_rtgs: [0.0, 0.05, 0.1, 0.2, 0.3]  # used when rtg_source: manual
+  train_rtg_percentiles: [10, 25, 50, 75, 90]
   context_len: 100
   max_eval_trajectories: 32
+  # Single pass over the full FI-2010 test file (Day 10); needs kagglehub dataset cache.
+  continuous_day10_plot: true

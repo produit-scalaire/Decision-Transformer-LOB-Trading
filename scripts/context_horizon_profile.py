@@ -30,11 +30,8 @@ if str(_ROOT) not in sys.path:
 from omegaconf import OmegaConf
 
 from src.evaluations.direction_metrics import compute_directional_f1
-from src.evaluations.dt_viz import (
-    compute_financial_metrics,
-    get_market_returns,
-    vectorized_autoregressive_rollout,
-)
+from src.evaluations.dt_viz import compute_financial_metrics, vectorized_autoregressive_rollout
+from src.evaluations.market_returns import get_market_returns
 from src.models.decision_transformer import DecisionTransformer
 
 # Table I (Setup 1), DeepLOB macro-style reporting — F1 from paper summary (%).
@@ -81,6 +78,7 @@ def run_profile(
     max_eval_trajectories: int,
     state_representation: str,
     model_cfg: dict,
+    rtg_rollout_mode: str = "anchored_offline",
 ) -> pd.DataFrame:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mc = OmegaConf.create(model_cfg)
@@ -96,19 +94,31 @@ def run_profile(
 
     market_returns = get_market_returns(states_batch, state_representation=state_representation)
 
+    reference_rtg = torch.stack(
+        [
+            torch.tensor(traj["rtg"][:min_len, 0], dtype=torch.float32)
+            for traj in trajectories
+        ]
+    ).to(device)
+
     rows = []
     for K, ckpt in checkpoints.items():
         if not ckpt.is_file():
             raise FileNotFoundError(f"Missing checkpoint for K={K}: {ckpt}")
         model = _load_model(ckpt, mc, device)
-        rewards, _, actions = vectorized_autoregressive_rollout(
+        rr_kw = dict(
             model=model,
             states=states_batch,
             market_returns=market_returns,
             target_rtg=target_rtg,
             context_len=K,
             device=device,
+            max_timestep=int(getattr(mc, "max_timestep", 10_000)),
+            rtg_rollout_mode=rtg_rollout_mode,
         )
+        if rtg_rollout_mode == "anchored_offline":
+            rr_kw["reference_rtg"] = reference_rtg
+        rewards, _, actions = vectorized_autoregressive_rollout(**rr_kw)
         fin = compute_financial_metrics(rewards)
         f1 = compute_directional_f1(actions, market_returns)
         rows.append(
@@ -155,7 +165,7 @@ def run_profile(
     )
 
     fig.suptitle(
-        f"Context horizon profile (RTG={target_rtg}, {state_representation})",
+        f"Context horizon profile (RTG={target_rtg}, {state_representation}, rollout={rtg_rollout_mode})",
         fontsize=11,
     )
     fig.tight_layout()
@@ -189,6 +199,12 @@ def main() -> None:
     parser.add_argument("--n_layers", type=int, default=3)
     parser.add_argument("--max_timestep", type=int, default=10000)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--rtg_rollout_mode",
+        choices=("autoregressive", "anchored_offline"),
+        default="anchored_offline",
+        help="RTG conditioning during rollout (see src/evaluations/dt_viz.py).",
+    )
     args = parser.parse_args()
 
     ckpt_map = _parse_kv_pairs(args.checkpoints)
@@ -210,6 +226,7 @@ def main() -> None:
         max_eval_trajectories=args.max_eval_trajectories,
         state_representation=args.state_representation,
         model_cfg=model_cfg,
+        rtg_rollout_mode=args.rtg_rollout_mode,
     )
 
     print(df.to_string(index=False))

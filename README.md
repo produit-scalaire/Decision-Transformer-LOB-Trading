@@ -76,6 +76,12 @@ The repository relies on `hydra-core` for hierarchical configuration management 
 - **Training**
 - **Evaluation**
 
+### FI-2010 Multi-Stock Handling
+
+FI-2010 cross-validation fold files concatenate all **5 Finnish stocks** along the time axis into a single matrix. Naively sampling random episodes from this concatenated array lets windows cross stock boundaries, where the mid-price jumps discontinuously between unrelated equities — producing garbage transitions and meaningless rewards.
+
+The data-generation pipeline therefore **detects stock boundaries** automatically (via large discontinuities in the mid-price series) and generates episodes **independently per stock**. Episode counts are allocated proportionally to each stock's data length. The continuous Day 10 evaluation (`continuous_day10_plot`) likewise evaluates per stock, producing one PnL plot per equity rather than a single plot that conflates five different instruments.
+
 ## Model Architectures
 
 Two model architectures are available and controlled entirely by the `model.architecture` key in `configs/config.yaml` (or via Hydra CLI override). Both models share the same interface, training loop, and evaluation code — only the state embedding module differs.
