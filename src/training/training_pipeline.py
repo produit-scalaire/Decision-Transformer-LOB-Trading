@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from src.models.decision_transformer import DecisionTransformer
+from src.models.model_factory import build_model
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -94,7 +94,8 @@ def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: f
     that don't (Biases, LayerNorms, Embeddings) following GPT design.
     """
     decay, no_decay = set(), set()
-    whitelist_modules = (nn.Linear,)
+    # Conv1d weights should also decay (same reasoning as Linear weights).
+    whitelist_modules = (nn.Linear, nn.Conv1d)
     blacklist_modules = (nn.LayerNorm, nn.Embedding)
     
     for mn, m in model.named_modules():
@@ -142,16 +143,8 @@ def train_model(train_data_path, model_dir, model_cfg, train_cfg, hardware_cfg):
         prefetch_factor=2
     )
 
-    # 3. Initialize Model
-    model = DecisionTransformer(
-        state_dim=model_cfg.state_dim, 
-        act_dim=model_cfg.act_dim,
-        d_model=model_cfg.d_model,
-        n_heads=model_cfg.n_heads,
-        n_layers=model_cfg.n_layers,
-        max_timestep=model_cfg.max_timestep,
-        dropout=model_cfg.dropout
-    ).to(device)
+    # 3. Build the model selected in config (transformer or cnn).
+    model = build_model(model_cfg).to(device)
 
     # 4. Compile Model (Triton Kernels for RTX 5090 Blackwell architecture)
     if hardware_cfg.compile_model:

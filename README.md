@@ -67,6 +67,102 @@ The repository relies on `hydra-core` for hierarchical configuration management 
 - **Training**
 - **Evaluation**
 
+## Model Architectures
+
+Two model architectures are available and controlled entirely by the `model.architecture` key in `configs/config.yaml` (or via Hydra CLI override). Both models share the same interface, training loop, and evaluation code — only the state embedding module differs.
+
+### Transformer (default)
+
+```
+architecture: "transformer"
+```
+
+The original Decision Transformer. The state vector `(state_dim,)` is embedded with a single linear projection (`nn.Linear(state_dim, d_model)`). This is the fast baseline.
+
+```
+State (B, K, state_dim)
+       │
+       ▼
+  nn.Linear(state_dim → d_model)
+       │
+       ▼
+  + time positional embedding
+       │
+       ▼
+  Causal Transformer blocks  ×  n_layers
+       │
+       ▼
+  Action head  →  logits (B, K, act_dim)
+```
+
+### CNN Encoder
+
+```
+architecture: "cnn"
+```
+
+Replaces the linear state embedding with a two-layer 1D CNN encoder (`CNNStateEncoder`). The state vector is treated as a 1D signal of length `state_dim` with one input channel. Two `Conv1d` layers (same-padding, GELU activations) extract local feature patterns, an `AdaptiveAvgPool1d(1)` collapses the spatial dimension to a fixed-size vector regardless of `state_dim`, and a final linear layer projects to `d_model`. Everything downstream (RTG/action embeddings, causal Transformer blocks, action head) is identical to the base model.
+
+```
+State (B, K, state_dim)
+       │
+       ▼  reshape → (B*K, 1, state_dim)
+  Conv1d(1 → cnn_channels, kernel=cnn_kernel_size)  →  GELU
+  Conv1d(cnn_channels → cnn_channels, kernel=cnn_kernel_size)  →  GELU
+       │
+       ▼
+  AdaptiveAvgPool1d(1)  →  squeeze  →  (B*K, cnn_channels)
+       │
+       ▼
+  nn.Linear(cnn_channels → d_model)  →  reshape → (B, K, d_model)
+       │
+       ▼
+  + time positional embedding
+       │
+       ▼
+  Causal Transformer blocks  ×  n_layers
+       │
+       ▼
+  Action head  →  logits (B, K, act_dim)
+```
+
+The `AdaptiveAvgPool1d` makes the encoder **state-dim agnostic**: it works identically for `raw` (41-dim), `log_returns` (41-dim), `bps` (41-dim), or any future state space with a different dimensionality — no code change required.
+
+#### CNN-specific config keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `model.cnn_channels` | `64` | Number of hidden channels in both Conv1d layers |
+| `model.cnn_kernel_size` | `3` | Kernel size for both Conv1d layers |
+
+These keys are ignored when `architecture: "transformer"`.
+
+### Switching architectures
+
+**From the command line (Hydra override):**
+
+```bash
+# Use the original transformer (default)
+python main.py model.architecture=transformer
+
+# Use the CNN encoder
+python main.py model.architecture=cnn
+
+# CNN with custom encoder width and kernel
+python main.py model.architecture=cnn model.cnn_channels=128 model.cnn_kernel_size=5
+```
+
+**In `configs/config.yaml`:**
+
+```yaml
+model:
+  architecture: "cnn"   # change this line
+  cnn_channels: 64
+  cnn_kernel_size: 3
+```
+
+> **Important:** a checkpoint saved with one architecture cannot be loaded by the other. If you switch architectures, you must retrain from scratch or keep separate `paths.model_dir` directories.
+
 ### 1. Standard Execution
 
 To run the full pipeline using the default parameters specified in `configs/config.yaml`:
@@ -130,7 +226,7 @@ Evaluation summaries from `main.py` also report **F1_macro** for Decision Transf
 
 ## Tests
 
-The suite uses [pytest](https://docs.pytest.org/) and exercises the LOB trading environment (including mid vs. shaped rewards, stationary state modes, and evaluation market-return helpers), trajectory dataset indexing, Decision Transformer forward pass and causality, and rollout worker behavior. Install dependencies (including `pytest`) from the repo root:
+The suite uses [pytest](https://docs.pytest.org/) and exercises: the LOB trading environment (mid vs. shaped rewards, stationary state modes, market-return helpers), trajectory dataset indexing, Decision Transformer forward pass and causality, rollout worker behavior, and the CNN encoder / model factory. Install dependencies (including `pytest`) from the repo root:
 
 ```bash
 pip install -r requirements.txt
@@ -164,7 +260,7 @@ The project root must be the current working directory so imports resolve (`src.
 - [x] **State Space Engineering:** Switchable observation construction for ask/bid **price** levels only—**`raw`** (dataset layout), **`log_returns`**, or **`bps`**—with **`generator.price_offset`** for numerical stability on z-scored data; volumes unchanged; dim stays 41. Implemented in `src/env/lob_trading_env.py`, config keys `generator.state_representation` / `generator.price_offset`, trajectory `init_worker` wiring in `src/data/trajectories_generator.py`, evaluation helpers in `src/evaluations/market_returns.py` and `evaluate_model(..., state_representation=...)` in `src/evaluations/dt_viz.py`; covered in `tests/test.py`.
 - [x] **Context Horizon Profiling:** Benchmark Sharpe ratio and macro-F1 (vs instantaneous mid-proxy oracle) across attention windows $K \in \{50, 100, 250, 500\}$ via per-$K$ training checkpoints and `scripts/context_horizon_profile.py`. DeepLOB (Zhang et al., 2018) FI-2010 movement F1 at horizons $k \in \{10,50,100\}$ is cited in the script plot as a qualitative reference only (different dataset and label definition).
 - [ ] **Architectural Scaling:** Conduct ablation studies on the transformer depth and width (`d_model`, `n_heads`, `n_layers`) relative to the available 32GB VRAM.
-- [ ] **CNN architecture:** Test with a CNN-based encoder (or architecture variant); add a Hydra/config parameter to switch between the current setup and the CNN path.
+- [x] **CNN architecture:** A CNN-based state encoder (`CNNDecisionTransformer`) is available as a drop-in replacement for the base transformer. A `model.architecture` config key switches between the two paths at runtime. See [Model Architectures](#model-architectures) below for details.
 - [ ] **Return-to-go horizon ($T$):** Make the horizon $T$ in the future-reward sum $\hat{R}_t = \sum_{t'=t}^{T} r_{t'}$ configurable or otherwise modifiable (decoupled from raw episode length where appropriate).
 
 ### Dataset & Environment Expansion

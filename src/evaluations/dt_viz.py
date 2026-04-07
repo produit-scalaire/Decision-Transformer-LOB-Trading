@@ -9,7 +9,7 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from src.evaluations.direction_metrics import compute_directional_f1
-from src.models.decision_transformer import DecisionTransformer
+from src.models.model_factory import build_model
 from src.evaluations.market_returns import get_market_returns
 
 # Disable interactive plotting to generate image files safely in the background
@@ -183,27 +183,60 @@ def plot_sharpe_comparison(df_metrics: pd.DataFrame, save_path: Path):
 
 def plot_pnl_curves(trajectories_dict: dict, save_path: Path):
     """
-    Plots the cumulative PnL progression over time for DT policies vs Baselines.
-    Highlights Oracle and the DT models specifically.
+    Plots cumulative PnL for DT policies vs baselines.
+
+    Uses two panels: the same data is shown on a full y-scale (Oracle can dominate)
+    and on a DT-only zoom so final PnLs of order 1e-3 are visible. Summary PnL and
+    this plot use the same cumulative series; a flat-looking DT line on the top panel
+    is usually scale/resolution, not a different computation than the table.
     """
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
+    dt_items = {k: v for k, v in trajectories_dict.items() if "DT" in k}
+
+    fig, (ax_full, ax_dt) = plt.subplots(
+        2,
+        1,
+        figsize=(12, 9),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 0.85], "hspace": 0.15},
+    )
+
     for agent, traj in trajectories_dict.items():
-        if agent == 'Oracle':
-            ax.plot(traj, label=agent, linestyle='--', color='gold', alpha=0.8)
-        elif 'DT' in agent:
-            # Highlight DT policies with thicker lines
-            ax.plot(traj, label=agent, linewidth=2.5)
+        if agent == "Oracle":
+            ax_full.plot(traj, label=agent, linestyle="--", color="gold", alpha=0.8)
+        elif "DT" in agent:
+            ax_full.plot(traj, label=agent, linewidth=2.5)
         else:
-            ax.plot(traj, label=agent, alpha=0.6)
-            
-    ax.axhline(0, color="black", linewidth=0.5)
-    ax.set_title("Cumulative PnL Comparison: Decision Transformer vs Baselines")
-    ax.set_xlabel("Time Steps")
-    ax.set_ylabel("Cumulative PnL")
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.3)
-    
+            ax_full.plot(traj, label=agent, alpha=0.6)
+
+    ax_full.axhline(0, color="black", linewidth=0.5)
+    ax_full.set_title(
+        "Cumulative PnL (full scale — DT may sit near 0 vs Oracle; see lower panel)"
+    )
+    ax_full.set_ylabel("Cumulative PnL")
+    ax_full.legend(loc="upper left", fontsize=8)
+    ax_full.grid(True, alpha=0.3)
+
+    if dt_items:
+        for agent, traj in dt_items.items():
+            ax_dt.plot(traj, label=agent, linewidth=2.5)
+        ax_dt.axhline(0, color="black", linewidth=0.5)
+        stacked = np.stack([np.asarray(v, dtype=np.float64) for v in dt_items.values()])
+        y_min = float(stacked.min())
+        y_max = float(stacked.max())
+        span = y_max - y_min
+        pad = max(span * 0.12, 1e-9)
+        if span < 1e-12:
+            ax_dt.set_ylim(-0.01, 0.01)
+        else:
+            ax_dt.set_ylim(y_min - pad, y_max + pad)
+        ax_dt.set_title("Decision Transformer cumulative PnL (zoomed to DT range)")
+        ax_dt.set_xlabel("Time Steps")
+        ax_dt.set_ylabel("Cumulative PnL")
+        ax_dt.legend(loc="best", fontsize=8)
+        ax_dt.grid(True, alpha=0.3)
+    else:
+        ax_dt.set_visible(False)
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
@@ -228,17 +261,9 @@ def evaluate_model(
     out_path = Path(plot_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load the Decision Transformer
+    # 1. Build the model from config and load the saved checkpoint.
     print(f"\nLoading model from {model_path}...")
-    model = DecisionTransformer(
-        state_dim=model_cfg.state_dim,
-        act_dim=model_cfg.act_dim,
-        d_model=model_cfg.d_model,
-        n_heads=model_cfg.n_heads,
-        n_layers=model_cfg.n_layers,
-        max_timestep=model_cfg.max_timestep,
-        dropout=model_cfg.dropout,
-    ).to(device)
+    model = build_model(model_cfg).to(device)
     
     checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     raw_state_dict = checkpoint['model_state_dict']
@@ -351,16 +376,23 @@ if __name__ == "__main__":
     out_path = Path(args.out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Load the Decision Transformer
-    print(f"\nLoading model from {args.model_path}...")
-    model = DecisionTransformer(
-        state_dim=40,
+    # 1. Build the model from CLI defaults and load checkpoint.
+    # Use a simple namespace so build_model receives the same interface as a Hydra cfg.
+    from types import SimpleNamespace
+    cli_model_cfg = SimpleNamespace(
+        architecture="transformer",
+        state_dim=41,
         act_dim=3,
-        d_model=128,  # Match training architecture
+        d_model=128,
         n_heads=4,
         n_layers=3,
-        max_ep_len=10000
-    ).to(device)
+        max_timestep=10000,
+        dropout=0.1,
+        cnn_channels=64,
+        cnn_kernel_size=3,
+    )
+    print(f"\nLoading model from {args.model_path}...")
+    model = build_model(cli_model_cfg).to(device)
     
     checkpoint = torch.load(args.model_path, map_location=device, weights_only=True)
     raw_state_dict = checkpoint['model_state_dict']

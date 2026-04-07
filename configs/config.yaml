@@ -24,12 +24,12 @@ paths:
 # Data generation parameters
 generator:
   train_episodes: 6000
-  test_episodes: 1200
+  test_episodes: 64
   window_size: 100
   episode_length: 2000
   # mid_price: PnL from mid changes only (default for DT / offline data).
   # shaped: same base PnL minus drawdown, rolling return variance, and |position| penalties.
-  reward_type: shaped
+  reward_type: mid-price
   reward_shaping:
     drawdown_coef: 0.02
     variance_coef: 0.5
@@ -40,7 +40,10 @@ generator:
   price_offset: 10.0
 
 # Decision Transformer architecture
+# Set architecture: "transformer" to use the original DT (default).
+# Set architecture: "cnn" to use the CNN-encoder variant.
 model:
+  architecture: "transformer"   # "transformer" | "cnn"
   state_dim: 41
   act_dim: 3
   d_model: 128
@@ -48,6 +51,9 @@ model:
   n_layers: 3
   max_timestep: 10000
   dropout: 0.1
+  # CNN-encoder settings (only used when architecture: "cnn")
+  cnn_channels: 64              # number of hidden channels in the CNN encoder
+  cnn_kernel_size: 3            # kernel size for both Conv1d layers
 
 # Optimization & Training
 training:

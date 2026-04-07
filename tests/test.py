@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from src.env.lob_trading_env import LOBTradingEnv, LOB_PRICE_COL_INDICES
 from src.models.decision_transformer import DecisionTransformer
+from src.models.cnn_decision_transformer import CNNDecisionTransformer, CNNStateEncoder
+from src.models.model_factory import build_model, SUPPORTED_ARCHITECTURES
 from src.training.training_pipeline import OptimizedTrajectoryDataset, configure_optimizers
 from src.data.trajectories_generator import rollout_worker, init_worker
 from src.evaluations.direction_metrics import oracle_actions_from_returns, compute_directional_f1
@@ -542,3 +544,181 @@ def test_worker_memory_isolation(dummy_lob_data: np.ndarray):
     recommended_workers = min(cores, max_allowed_workers)
     
     assert recommended_workers <= 8, "Worker limit bypassed. Potential VRAM/RAM saturation risk."
+
+
+# =============================================================================
+# CNN DECISION TRANSFORMER TESTS
+# =============================================================================
+
+# Minimal model config used by the factory tests below.
+# Using types.SimpleNamespace so we don't depend on Hydra in unit tests.
+from types import SimpleNamespace
+
+def _make_model_cfg(architecture: str = "transformer") -> SimpleNamespace:
+    return SimpleNamespace(
+        architecture=architecture,
+        state_dim=41,
+        act_dim=3,
+        d_model=64,
+        n_heads=2,
+        n_layers=2,
+        max_timestep=1000,
+        dropout=0.0,
+        cnn_channels=32,
+        cnn_kernel_size=3,
+    )
+
+
+def test_cnn_state_encoder_output_shape_various_state_dims():
+    """CNNStateEncoder must produce (B, K, d_model) for any state_dim."""
+    d_model = 64
+    for state_dim in [10, 41, 100, 200]:
+        encoder = CNNStateEncoder(state_dim=state_dim, d_model=d_model, channels=32, kernel_size=3)
+        x = torch.randn(2, 5, state_dim)
+        out = encoder(x)
+        assert out.shape == (2, 5, d_model), (
+            f"CNNStateEncoder output shape wrong for state_dim={state_dim}: got {out.shape}"
+        )
+
+
+def test_cnn_dt_forward_pass_shapes():
+    """CNNDecisionTransformer forward pass produces correct output shapes for various state_dims."""
+    for state_dim in [10, 41, 80]:
+        model = CNNDecisionTransformer(
+            state_dim=state_dim, act_dim=3, d_model=64,
+            n_heads=2, n_layers=2, max_timestep=1000,
+            cnn_channels=32, cnn_kernel_size=3,
+        )
+        B, K = 4, 20
+        states = torch.randn(B, K, state_dim)
+        actions = torch.randint(0, 3, (B, K))
+        rtg = torch.randn(B, K, 1)
+        timesteps = torch.arange(K).unsqueeze(0).expand(B, -1)
+        logits = model(states, actions, rtg, timesteps)
+        assert logits.shape == (B, K, 3), (
+            f"CNNDecisionTransformer output shape wrong for state_dim={state_dim}: got {logits.shape}"
+        )
+
+
+def test_model_factory_returns_transformer():
+    """build_model returns a DecisionTransformer when architecture='transformer'."""
+    model = build_model(_make_model_cfg("transformer"))
+    assert isinstance(model, DecisionTransformer)
+
+
+def test_model_factory_returns_cnn():
+    """build_model returns a CNNDecisionTransformer when architecture='cnn'."""
+    model = build_model(_make_model_cfg("cnn"))
+    assert isinstance(model, CNNDecisionTransformer)
+
+
+def test_model_factory_invalid_architecture_raises():
+    """build_model raises ValueError for unknown architecture names."""
+    cfg = _make_model_cfg()
+    cfg.architecture = "lstm"
+    with pytest.raises(ValueError, match="Unknown architecture"):
+        build_model(cfg)
+
+
+def test_model_factory_supported_architectures_constant():
+    """SUPPORTED_ARCHITECTURES must contain exactly 'transformer' and 'cnn'."""
+    assert "transformer" in SUPPORTED_ARCHITECTURES
+    assert "cnn" in SUPPORTED_ARCHITECTURES
+
+
+@torch.no_grad()
+def test_cnn_dt_causality():
+    """
+    Causal masking must hold for CNNDecisionTransformer:
+    modifying token at t=10 must not change logits at t < 10.
+    """
+    state_dim, act_dim, K = 41, 3, 20
+    model = CNNDecisionTransformer(
+        state_dim=state_dim, act_dim=act_dim, d_model=64,
+        n_heads=2, n_layers=2, cnn_channels=32,
+    ).eval()
+
+    states = torch.randn(1, K, state_dim)
+    actions = torch.randint(0, act_dim, (1, K))
+    rtg = torch.randn(1, K, 1)
+    timesteps = torch.arange(K).unsqueeze(0)
+
+    logits_base = model(states, actions, rtg, timesteps)
+
+    states_perturbed = states.clone()
+    states_perturbed[0, 10, :] += 100.0
+
+    logits_perturbed = model(states_perturbed, actions, rtg, timesteps)
+
+    assert torch.allclose(logits_base[0, :10, :], logits_perturbed[0, :10, :], atol=1e-6), \
+        "CAUSALITY LEAK in CNNDecisionTransformer: future tokens affect past predictions."
+    assert not torch.allclose(logits_base[0, 10:, :], logits_perturbed[0, 10:, :], atol=1e-6), \
+        "CNNDecisionTransformer failed to react to perturbation at t=10."
+
+
+@torch.no_grad()
+def test_cnn_dt_eval_deterministic():
+    """Same inputs in eval mode produce identical logits (no dropout noise)."""
+    torch.manual_seed(0)
+    model = CNNDecisionTransformer(
+        state_dim=41, act_dim=3, d_model=64, n_heads=2, n_layers=2,
+        cnn_channels=32, dropout=0.0,
+    ).eval()
+    B, K = 2, 32
+    states = torch.randn(B, K, 41)
+    actions = torch.randint(0, 3, (B, K))
+    rtg = torch.randn(B, K, 1)
+    timesteps = torch.arange(K).unsqueeze(0).expand(B, -1)
+    out1 = model(states, actions, rtg, timesteps)
+    out2 = model(states, actions, rtg, timesteps)
+    assert torch.equal(out1, out2)
+
+
+def test_configure_optimizers_covers_cnn_model_params():
+    """
+    All CNNDecisionTransformer parameters must be in exactly one AdamW group.
+    Conv1d weights go to the decay group; biases/norms go to no-decay.
+    """
+    model = CNNDecisionTransformer(
+        state_dim=41, act_dim=3, d_model=32, n_heads=2, n_layers=1,
+        cnn_channels=16, dropout=0.0,
+    )
+    opt = configure_optimizers(model, weight_decay=0.1, learning_rate=1e-4, betas=(0.9, 0.95))
+    assert len(opt.param_groups) == 2
+
+    grouped_ids = set()
+    for g in opt.param_groups:
+        for p in g["params"]:
+            grouped_ids.add(id(p))
+
+    named = dict(model.named_parameters())
+    assert len(grouped_ids) == len(named), \
+        "CNN model: some parameters are missing from or duplicated in optimizer groups."
+    assert (
+        sum(p.numel() for p in model.parameters())
+        == sum(p.numel() for g in opt.param_groups for p in g["params"])
+    )
+
+
+def test_training_pipeline_builds_cnn_from_config(dummy_trajectories_file: str):
+    """
+    End-to-end check: build_model with cnn config + real dataset batch flows through
+    the CNN DT without errors.
+    """
+    cfg = _make_model_cfg("cnn")
+    model = build_model(cfg)
+    assert isinstance(model, CNNDecisionTransformer)
+
+    ds = OptimizedTrajectoryDataset(data_path=dummy_trajectories_file, context_len=100)
+    states, actions, rtg, timesteps = ds[0]
+
+    # Add the batch dimension expected by the model.
+    with torch.no_grad():
+        logits = model(
+            states.unsqueeze(0),
+            actions.unsqueeze(0),
+            rtg.unsqueeze(0),
+            timesteps.unsqueeze(0),
+        )
+
+    assert logits.shape == (1, 100, 3), f"Unexpected output shape: {logits.shape}"
