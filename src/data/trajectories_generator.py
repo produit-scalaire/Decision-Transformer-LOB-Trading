@@ -7,12 +7,15 @@ Generates both Train (Days 1-9) and Test (Day 10) datasets.
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import multiprocessing as mp
-from multiprocessing import Pool
 import os
+import sys
 import argparse
 from pathlib import Path
+from typing import Any
 from tqdm import tqdm
 from src.env.lob_trading_env import LOBTradingEnv
 
@@ -126,6 +129,114 @@ def compute_rtg(rewards: np.ndarray, horizon: int | None) -> np.ndarray:
     return (prefix[end_indices] - prefix[start_indices]).astype(np.float32)
 
 
+def _trajectory_returns(trajectories: list[dict[str, Any]]) -> np.ndarray:
+    """Return per-trajectory final returns as float64 array."""
+    return np.asarray([float(t["total_return"]) for t in trajectories], dtype=np.float64)
+
+
+def filter_trajectories_by_quality(
+    trajectories: list[dict[str, Any]],
+    *,
+    mode: str,
+    quantile: float,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Elitist filtering of trajectories (no policy quota constraints).
+
+    Modes
+    -----
+    none:
+        Keep all trajectories.
+    top_quantile:
+        Keep trajectories with total_return >= quantile threshold.
+    positive_only:
+        Keep trajectories with total_return > 0.
+    """
+    if mode == "none":
+        returns = _trajectory_returns(trajectories)
+        return trajectories, {
+            "kept": float(len(trajectories)),
+            "dropped": 0.0,
+            "kept_ratio": 1.0,
+            "threshold": float("nan"),
+            "mean_return_before": float(returns.mean()) if len(returns) else float("nan"),
+            "mean_return_after": float(returns.mean()) if len(returns) else float("nan"),
+        }
+
+    if not trajectories:
+        raise ValueError("Cannot filter an empty trajectory list.")
+
+    returns = _trajectory_returns(trajectories)
+    if mode == "top_quantile":
+        q = float(quantile)
+        if not (0.0 < q < 1.0):
+            raise ValueError(f"quality_quantile must be in (0,1), got {q}.")
+        threshold = float(np.quantile(returns, q))
+        keep_mask = returns >= threshold
+    elif mode == "positive_only":
+        threshold = 0.0
+        keep_mask = returns > 0.0
+    else:
+        raise ValueError(
+            f"Unknown quality_filter_mode={mode!r}. Expected one of "
+            "'none', 'top_quantile', 'positive_only'."
+        )
+
+    filtered = [t for t, keep in zip(trajectories, keep_mask.tolist()) if keep]
+    if not filtered:
+        raise RuntimeError(
+            "Quality filtering removed all trajectories. Relax quality_filter_mode/quality_quantile."
+        )
+
+    after = _trajectory_returns(filtered)
+    return filtered, {
+        "kept": float(len(filtered)),
+        "dropped": float(len(trajectories) - len(filtered)),
+        "kept_ratio": float(len(filtered) / len(trajectories)),
+        "threshold": threshold,
+        "mean_return_before": float(returns.mean()),
+        "mean_return_after": float(after.mean()),
+    }
+
+
+def fit_rtg_standardizer(
+    trajectories: list[dict[str, Any]],
+    *,
+    eps: float = 1e-8,
+) -> dict[str, float]:
+    """Fit RTG z-score parameters on a trajectory list."""
+    if not trajectories:
+        raise ValueError("Cannot fit RTG scaler on empty trajectories.")
+    rtg_values: list[np.ndarray] = []
+    for t in trajectories:
+        rtg_t = t["rtg"]
+        if isinstance(rtg_t, torch.Tensor):
+            arr = rtg_t.detach().cpu().numpy()
+        else:
+            arr = np.asarray(rtg_t)
+        rtg_values.append(arr.reshape(-1))
+    all_rtg = np.concatenate(rtg_values).astype(np.float64, copy=False)
+    mu = float(all_rtg.mean())
+    sigma = float(all_rtg.std())
+    sigma_safe = max(sigma, float(eps))
+    return {"mean": mu, "std": sigma_safe, "eps": float(eps)}
+
+
+def apply_rtg_standardizer(
+    trajectories: list[dict[str, Any]],
+    scaler: dict[str, float],
+) -> None:
+    """In-place RTG z-score standardization using fixed train scaler."""
+    mu = float(scaler["mean"])
+    sigma = float(scaler["std"])
+    for t in trajectories:
+        rtg_t = t["rtg"]
+        if isinstance(rtg_t, torch.Tensor):
+            t["rtg"] = (rtg_t.to(torch.float32) - mu) / sigma
+        else:
+            arr = np.asarray(rtg_t, dtype=np.float32)
+            t["rtg"] = ((arr - mu) / sigma).astype(np.float32)
+
+
 def init_worker(
     X_data,
     y_data,
@@ -221,6 +332,35 @@ POLICIES = {
     "label_mom":  label_momentum_policy,
     "mean_rev":   mean_reversion_policy,
 }
+
+
+def _trajectory_pool_context():
+    """Return a multiprocessing context safe to use with PyTorch.
+
+    ``fork`` after CUDA initialization is unsafe; workers may crash and the
+    parent then sees follow-on ``BrokenPipeError`` noise. ``spawn`` avoids that
+    (at the cost of pickling ``initargs`` per worker). Windows always uses spawn.
+    """
+    if sys.platform == "win32":
+        return mp.get_context("spawn")
+    try:
+        if torch.cuda.is_initialized():
+            return mp.get_context("spawn")
+    except Exception:
+        pass
+    return mp.get_context("fork")
+
+
+def _make_trajectory_pool(processes: int, initializer, initargs):
+    """Episode Pool with recycled workers to limit memory growth / fd pressure."""
+    ctx = _trajectory_pool_context()
+    return ctx.Pool(
+        processes=processes,
+        initializer=initializer,
+        initargs=initargs,
+        maxtasksperchild=48,
+    )
+
 
 # -----------------------------------------------------------------------------
 # PLOTTING FUNCTIONS
@@ -558,54 +698,67 @@ def generate_dataset(
         f"Reward: {reward_type} | state={state_representation} | "
         f"window={window_size} len={episode_length} | RTG horizon={horizon_str}"
     )
-    
+
+    num_workers = max(1, int(num_workers))
+
     # Create job list (assigning equal number of episodes to each policy)
     episodes_per_policy = num_episodes // len(POLICIES)
+    if episodes_per_policy < 1:
+        raise ValueError(
+            f"num_episodes={num_episodes} must be >= len(POLICIES)={len(POLICIES)} "
+            "so each policy gets at least one episode."
+        )
     jobs = []
-    
+
     for policy_name in POLICIES.keys():
         # Offset seed to ensure unique randomness across policies
         seed_offset = list(POLICIES.keys()).index(policy_name) * 100000
         for i in range(episodes_per_policy):
             jobs.append((policy_name, seed_offset + i))
-            
+
     all_trajectories = []
-    
-    # We use initializer to pass the heavy Data Arrays ONCE per worker.
-    with Pool(
-        processes=num_workers,
-        initializer=init_worker,
-        initargs=(
-            X,
-            y,
-            window_size,
-            episode_length,
-            reward_type,
-            reward_shaping,
-            state_representation,
-            price_offset,
-            reward_horizon,
-        ),
-    ) as pool:
-        
-        # Process jobs and show progress bar
-        with tqdm(total=len(jobs), desc=desc, unit="ep") as pbar:
-            for traj in pool.imap_unordered(rollout_worker, jobs, chunksize=16):
-                
-                # Convert NumPy arrays to PyTorch Tensors in the MAIN process.
-                # This guarantees we do not exhaust OS file descriptors.
-                torch_traj = {
-                    "states": torch.from_numpy(traj["states"]),
-                    "actions": torch.from_numpy(traj["actions"]),
-                    "rewards": torch.from_numpy(traj["rewards"]),
-                    "rtg": torch.from_numpy(traj["rtg"]),
-                    "timesteps": torch.from_numpy(traj["timesteps"]),
-                    "policy": traj["policy"],
-                    "total_return": traj["total_return"]
-                }
-                
-                all_trajectories.append(torch_traj)
-                pbar.update()
+
+    initargs = (
+        X,
+        y,
+        window_size,
+        episode_length,
+        reward_type,
+        reward_shaping,
+        state_representation,
+        price_offset,
+        reward_horizon,
+    )
+    # Smaller chunks when many workers → fewer large pickles in flight on the result pipe.
+    chunksize = max(1, min(32, len(jobs) // (num_workers * 4) or 1))
+
+    # We use initializer to pass the heavy Data Arrays ONCE per worker (fork)
+    # or once per worker recycle (spawn / maxtasksperchild).
+    try:
+        with _make_trajectory_pool(num_workers, init_worker, initargs) as pool:
+            with tqdm(total=len(jobs), desc=desc, unit="ep") as pbar:
+                for traj in pool.imap_unordered(rollout_worker, jobs, chunksize=chunksize):
+                    # Convert NumPy arrays to PyTorch Tensors in the MAIN process.
+                    # This guarantees we do not exhaust OS file descriptors.
+                    torch_traj = {
+                        "states": torch.from_numpy(traj["states"]),
+                        "actions": torch.from_numpy(traj["actions"]),
+                        "rewards": torch.from_numpy(traj["rewards"]),
+                        "rtg": torch.from_numpy(traj["rtg"]),
+                        "timesteps": torch.from_numpy(traj["timesteps"]),
+                        "policy": traj["policy"],
+                        "total_return": traj["total_return"],
+                    }
+
+                    all_trajectories.append(torch_traj)
+                    pbar.update()
+    except Exception as exc:
+        raise RuntimeError(
+            "Trajectory generation Pool failed. If you only see BrokenPipeError "
+            "from ForkPoolWorker-* below, that is usually the parent process having "
+            "already crashed or closed the pool — scroll **up** for the first "
+            f"traceback. Underlying error: {type(exc).__name__}: {exc}"
+        ) from exc
 
     # Save to disk (skip when called in per-stock mode with output_file=None)
     if output_file is not None:
@@ -625,7 +778,7 @@ def _generate_per_stock(
     X_full: np.ndarray,
     y_full: np.ndarray,
     total_episodes: int,
-    output_file: str,
+    output_file: str | None,
     workers: int,
     split_label: str,
     plot_dir: str,
@@ -691,12 +844,10 @@ def _generate_per_stock(
         )
         all_trajectories.extend(trajs)
 
-    # Save combined dataset
-    torch.save(all_trajectories, output_file)
-    print(f"Saved {len(all_trajectories)} trajectories to {output_file}")
-
-    # Distribution plots on the combined trajectories
-    plot_distributions(all_trajectories, split_label, plot_dir)
+    # Optional save (callers may post-process before writing final dataset).
+    if output_file is not None:
+        torch.save(all_trajectories, output_file)
+        print(f"Saved {len(all_trajectories)} trajectories to {output_file}")
     return all_trajectories
 
 
@@ -714,6 +865,10 @@ def generate_dataset_pipeline(
     state_representation: str = "raw",
     price_offset: float = 10.0,
     reward_horizon: int | None = None,
+    quality_filter_mode: str = "none",
+    quality_quantile: float = 0.8,
+    standardize_rtg: bool = True,
+    rtg_scaler_out: str | None = None,
 ):
     """Encapsulated entry point for Hydra orchestrator."""
     # 1. Download Dataset via kagglehub
@@ -741,11 +896,52 @@ def generate_dataset_pipeline(
     X_train = train_raw[:40, :].T.astype(np.float32)
     y_train = train_raw[144:, :].T.astype(np.float32)
 
-    _generate_per_stock(
-        X_train, y_train, train_episodes, train_out, workers,
+    train_trajectories = _generate_per_stock(
+        X_train, y_train, train_episodes, None, workers,
         split_label="Train", plot_dir=plot_dir, **gen_kwargs,
     )
     del train_raw, X_train, y_train
+
+    train_trajectories, filt_stats = filter_trajectories_by_quality(
+        train_trajectories,
+        mode=quality_filter_mode,
+        quantile=quality_quantile,
+    )
+    print(
+        "Train quality filter "
+        f"mode={quality_filter_mode!r}: kept={int(filt_stats['kept'])} "
+        f"dropped={int(filt_stats['dropped'])} kept_ratio={filt_stats['kept_ratio']:.2%} "
+        f"threshold={filt_stats['threshold']:.6g} "
+        f"mean_return(before={filt_stats['mean_return_before']:.6g}, "
+        f"after={filt_stats['mean_return_after']:.6g})"
+    )
+
+    scaler: dict[str, float] | None = None
+    if standardize_rtg:
+        scaler = fit_rtg_standardizer(train_trajectories)
+        apply_rtg_standardizer(train_trajectories, scaler)
+        default_scaler_path = str(Path(train_out).with_name(f"{Path(train_out).stem}_rtg_scaler.pt"))
+        scaler_path = rtg_scaler_out or default_scaler_path
+        torch.save(
+            {
+                "rtg_mean": float(scaler["mean"]),
+                "rtg_std": float(scaler["std"]),
+                "eps": float(scaler["eps"]),
+                "mode": "zscore",
+                "train_trajectories": int(len(train_trajectories)),
+                "quality_filter_mode": quality_filter_mode,
+                "quality_quantile": float(quality_quantile),
+            },
+            scaler_path,
+        )
+        print(
+            f"Saved RTG scaler to {scaler_path} "
+            f"(mean={scaler['mean']:.6g}, std={scaler['std']:.6g})."
+        )
+
+    torch.save(train_trajectories, train_out)
+    print(f"Saved {len(train_trajectories)} trajectories to {train_out}")
+    plot_distributions(train_trajectories, "Train", plot_dir)
 
     # 3. Load & generate Test Data (Day 10)
     print("Loading Test Data (Day 10)...")
@@ -753,11 +949,19 @@ def generate_dataset_pipeline(
     X_test = test_raw[:40, :].T.astype(np.float32)
     y_test = test_raw[144:, :].T.astype(np.float32)
 
-    _generate_per_stock(
-        X_test, y_test, test_episodes, test_out, workers,
+    test_trajectories = _generate_per_stock(
+        X_test, y_test, test_episodes, None, workers,
         split_label="Test", plot_dir=plot_dir, **gen_kwargs,
     )
     del test_raw, X_test, y_test
+
+    if standardize_rtg:
+        if scaler is None:
+            raise RuntimeError("Internal error: RTG scaler missing despite standardize_rtg=True.")
+        apply_rtg_standardizer(test_trajectories, scaler)
+    torch.save(test_trajectories, test_out)
+    print(f"Saved {len(test_trajectories)} trajectories to {test_out}")
+    plot_distributions(test_trajectories, "Test", plot_dir)
 
     print(f"All processes completed successfully. Outputs saved at {train_out} and {test_out}.")
 

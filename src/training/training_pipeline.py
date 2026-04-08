@@ -2,6 +2,8 @@ import os
 import time
 import argparse
 from pathlib import Path
+import matplotlib
+matplotlib.use("Agg")
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -200,20 +202,27 @@ def train_model(
     device = torch.device(hardware_cfg.device if torch.cuda.is_available() else 'cpu')
     print(f"--- Hardware target: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'} ---")
 
+    # Hydra resolves YAML numerics; plain OmegaConf/yaml loads may leave 1e-4 as str.
+    lr = float(train_cfg.lr)
+    weight_decay = float(train_cfg.weight_decay)
+    context_len = int(train_cfg.context_len)
+    batch_size = int(train_cfg.batch_size)
+    n_epochs = int(train_cfg.epochs)
+
     # 1. Load Dataset on CPU
     dataset = OptimizedTrajectoryDataset(
-        data_path=train_data_path, 
-        context_len=train_cfg.context_len
+        data_path=train_data_path,
+        context_len=context_len,
     )
     
     # 2. Optimized DataLoader Setup
     dataloader = DataLoader(
-        dataset, 
-        batch_size=train_cfg.batch_size, 
-        shuffle=True, 
-        num_workers=hardware_cfg.workers, 
-        pin_memory=True, 
-        prefetch_factor=2
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=int(hardware_cfg.workers),
+        pin_memory=True,
+        prefetch_factor=2,
     )
 
     # 3. Build the model selected in config (transformer or cnn).
@@ -225,13 +234,13 @@ def train_model(
         model = torch.compile(model, mode="max-autotune")
     
     # 5. Optimizer & Scheduler
-    optimizer = configure_optimizers(model, train_cfg.weight_decay, train_cfg.lr, (0.9, 0.95))
-    total_steps = len(dataloader) * train_cfg.epochs
+    optimizer = configure_optimizers(model, weight_decay, lr, (0.9, 0.95))
+    total_steps = len(dataloader) * n_epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
     loss_fn = nn.CrossEntropyLoss()
 
     print("=" * 80)
-    print(f"Starting Training: {train_cfg.epochs} Epochs | Batch: {train_cfg.batch_size} | K: {train_cfg.context_len}")
+    print(f"Starting Training: {n_epochs} Epochs | Batch: {batch_size} | K: {context_len}")
     print(f"Total gradient steps per epoch: {len(dataloader):,}")
     print("=" * 80)
 
@@ -246,7 +255,7 @@ def train_model(
     log_every = max(1, len(dataloader) // 10)   # ~10 loss points per epoch
 
     # 7. Training Loop
-    for epoch in range(1, train_cfg.epochs + 1):
+    for epoch in range(1, n_epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_correct = 0

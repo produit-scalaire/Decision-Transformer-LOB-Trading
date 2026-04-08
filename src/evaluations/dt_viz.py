@@ -5,10 +5,12 @@ import time
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
+import matplotlib
 import numpy as np
 import pandas as pd
+matplotlib.use("Agg")
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -60,6 +62,34 @@ def resolve_target_rtgs(eval_cfg: Any, train_data_path: str | None) -> list[floa
         returns = _load_train_initial_rtg(train_data_path)
         return [float(np.percentile(returns, p)) for p in pct]
     return _as_float_list(getattr(eval_cfg, "target_rtgs", []))
+
+
+def _default_rtg_scaler_path(train_data_path: str | None) -> Path | None:
+    if not train_data_path:
+        return None
+    p = Path(train_data_path)
+    return p.with_name(f"{p.stem}_rtg_scaler.pt")
+
+
+def load_rtg_scaler(eval_cfg: Any, train_data_path: str | None) -> dict[str, float] | None:
+    """Load RTG z-score scaler metadata if available."""
+    explicit = getattr(eval_cfg, "rtg_scaler_path", None)
+    scaler_path = Path(explicit) if explicit else _default_rtg_scaler_path(train_data_path)
+    if scaler_path is None or not scaler_path.is_file():
+        return None
+    payload = torch.load(str(scaler_path), map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"RTG scaler at {scaler_path} must be a dict payload.")
+    if "rtg_std" not in payload:
+        raise ValueError(f"RTG scaler at {scaler_path} missing required key 'rtg_std'.")
+    out = {
+        "rtg_mean": float(payload.get("rtg_mean", 0.0)),
+        "rtg_std": float(payload["rtg_std"]),
+        "eps": float(payload.get("eps", 1e-8)),
+    }
+    if out["rtg_std"] <= 0.0:
+        raise ValueError(f"Invalid rtg_std={out['rtg_std']} in scaler {scaler_path}.")
+    return out
 
 
 def precompute_chronological_lob_tails_and_returns(
@@ -162,8 +192,8 @@ def vectorized_autoregressive_rollout(
     device,
     max_timestep: int,
     *,
-    rtg_rollout_mode: str = "autoregressive",
-    reference_rtg: torch.Tensor | None = None,
+    transaction_cost: float = 0.0,
+    rtg_reward_scale: float = 1.0,
 ):
     """Step-by-step autoregressive rollout for the Decision Transformer.
 
@@ -216,31 +246,6 @@ def vectorized_autoregressive_rollout(
     if feature_dim < 2:
         raise ValueError("state vector must include at least one LOB feature and position")
 
-    if rtg_rollout_mode not in ("autoregressive", "anchored_offline"):
-        raise ValueError(
-            f"rtg_rollout_mode must be 'autoregressive' or 'anchored_offline'; "
-            f"got {rtg_rollout_mode!r}"
-        )
-    if rtg_rollout_mode == "anchored_offline":
-        if reference_rtg is None:
-            raise ValueError("anchored_offline rollout requires reference_rtg (B, T)")
-        if reference_rtg.shape != (B, T):
-            raise ValueError(
-                f"reference_rtg must have shape ({B}, {T}); got {tuple(reference_rtg.shape)}"
-            )
-        reference_rtg = reference_rtg.to(device=device, dtype=torch.float32)
-
-    conditioned_rtg_table: torch.Tensor | None = None
-    if rtg_rollout_mode == "anchored_offline":
-        ref0 = reference_rtg[:, 0]
-        tg = torch.as_tensor(float(target_rtg), device=device, dtype=reference_rtg.dtype)
-        eps = 1e-5
-        safe = ref0.abs() > eps
-        scale = tg / torch.where(safe, ref0, torch.ones_like(ref0))
-        scaled_all = reference_rtg * scale.unsqueeze(1)
-        add_all = tg + reference_rtg - ref0.unsqueeze(1)
-        conditioned_rtg_table = torch.where(safe.unsqueeze(1), scaled_all, add_all)
-
     predicted_positions = torch.zeros((B, T), device=device)
     predicted_actions = torch.zeros((B, T), dtype=torch.long, device=device)
     realized_rewards = torch.zeros((B, T), device=device)
@@ -264,10 +269,7 @@ def vectorized_autoregressive_rollout(
             state_row[:, -1] = current_pos
 
             hist_states.append(state_row)
-            if rtg_rollout_mode == "anchored_offline":
-                hist_rtg.append(conditioned_rtg_table[:, t].clone())
-            else:
-                hist_rtg.append(current_rtg.squeeze(-1).clone())
+            hist_rtg.append(current_rtg.squeeze(-1).clone())
             hist_timesteps.append(
                 torch.full((B,), min(t, t_cap), dtype=torch.long, device=device)
             )
@@ -284,21 +286,26 @@ def vectorized_autoregressive_rollout(
             ctx_timesteps = torch.stack(hist_timesteps[-L:], dim=1)
 
             # Left-pad to context_len so the model always sees the same
-            # sequence length as training.  Padding values: zero state,
-            # Flat action (1), zero RTG, timestep 0.
+            # sequence length as training. To avoid OOD jumps in raw-state
+            # mode, replicate the first available real token for state/rtg/time.
+            # Action padding remains Flat (1).
             if L < context_len:
                 pad = context_len - L
-                ctx_states = F.pad(ctx_states, (0, 0, pad, 0))
+                s0 = ctx_states[:, :1, :].expand(-1, pad, -1)
+                ctx_states = torch.cat([s0, ctx_states], dim=1)
                 ctx_actions = F.pad(ctx_actions, (pad, 0), value=1)
-                ctx_rtg = F.pad(ctx_rtg, (0, 0, pad, 0))
-                ctx_timesteps = F.pad(ctx_timesteps, (pad, 0))
+                r0 = ctx_rtg[:, :1, :].expand(-1, pad, -1)
+                ctx_rtg = torch.cat([r0, ctx_rtg], dim=1)
+                t0 = ctx_timesteps[:, :1].expand(-1, pad)
+                ctx_timesteps = torch.cat([t0, ctx_timesteps], dim=1)
 
             action_preds = model(ctx_states, ctx_actions, ctx_rtg, ctx_timesteps)
             last_pred = action_preds[:, -1, :]
             action = torch.argmax(last_pred, dim=-1)
 
             pos = action.float() - 1.0
-            step_reward = pos * market_returns[:, t]
+            delta_pos = torch.abs(pos - current_pos)
+            step_reward = pos * market_returns[:, t] - float(transaction_cost) * delta_pos
 
             predicted_positions[:, t] = pos
             predicted_actions[:, t] = action
@@ -307,8 +314,7 @@ def vectorized_autoregressive_rollout(
             # Overwrite placeholder with the real action (visible to future steps)
             hist_actions[-1] = action
 
-            if rtg_rollout_mode == "autoregressive":
-                current_rtg = current_rtg - step_reward.unsqueeze(-1)
+            current_rtg = current_rtg - step_reward.unsqueeze(-1) * float(rtg_reward_scale)
             current_pos = pos
 
             # Trim lists to bound memory on long rollouts
@@ -321,7 +327,7 @@ def vectorized_autoregressive_rollout(
     return realized_rewards, predicted_positions, predicted_actions
 
 
-def evaluate_baselines(market_returns: torch.Tensor):
+def evaluate_baselines(market_returns: torch.Tensor, transaction_cost: float = 0.0):
     """Evaluate classic quantitative baseline policies.
 
     Policies: Buy & Hold, Oracle (perfect foresight), Momentum, Mean Reversion.
@@ -330,38 +336,52 @@ def evaluate_baselines(market_returns: torch.Tensor):
     -------
     trajectories_dict : {name: cumulative-PnL array}
     metrics_dict      : {name: metrics dict}
+    mean_rewards_dict : {name: mean step-reward series}
     """
-    metrics_dict = {}
-    trajectories_dict = {}
+    metrics_dict: dict[str, dict] = {}
+    trajectories_dict: dict[str, np.ndarray] = {}
+    mean_rewards_dict: dict[str, np.ndarray] = {}
 
-    bnh_pnl = market_returns.cumsum(dim=1)
+    def _rewards_from_pos(pos: torch.Tensor) -> torch.Tensor:
+        prev = torch.zeros((pos.size(0), 1), device=pos.device, dtype=pos.dtype)
+        delta = torch.abs(pos[:, 1:] - pos[:, :-1])
+        delta = torch.cat([torch.abs(pos[:, :1] - prev), delta], dim=1)
+        return pos * market_returns - float(transaction_cost) * delta
+
+    bnh_pos = torch.ones_like(market_returns)
+    bnh_rewards = _rewards_from_pos(bnh_pos)
+    bnh_pnl = bnh_rewards.cumsum(dim=1)
     trajectories_dict["Buy & Hold"] = bnh_pnl.mean(dim=0).cpu().numpy()
-    metrics_dict["Buy & Hold"] = compute_financial_metrics(market_returns)
+    metrics_dict["Buy & Hold"] = compute_financial_metrics(bnh_rewards)
+    mean_rewards_dict["Buy & Hold"] = bnh_rewards.mean(dim=0).cpu().numpy()
 
     oracle_pos = torch.where(
         market_returns > 0, 1.0,
         torch.where(market_returns < 0, -1.0, 0.0)
     )
-    oracle_rewards = oracle_pos * market_returns
+    oracle_rewards = _rewards_from_pos(oracle_pos)
     oracle_pnl = oracle_rewards.cumsum(dim=1)
     trajectories_dict["Oracle"] = oracle_pnl.mean(dim=0).cpu().numpy()
     metrics_dict["Oracle"] = compute_financial_metrics(oracle_rewards)
+    mean_rewards_dict["Oracle"] = oracle_rewards.mean(dim=0).cpu().numpy()
 
     mom_pos = torch.zeros_like(market_returns)
     mom_pos[:, 1:] = torch.sign(market_returns[:, :-1])
-    mom_rewards = mom_pos * market_returns
+    mom_rewards = _rewards_from_pos(mom_pos)
     mom_pnl = mom_rewards.cumsum(dim=1)
     trajectories_dict["Momentum"] = mom_pnl.mean(dim=0).cpu().numpy()
     metrics_dict["Momentum"] = compute_financial_metrics(mom_rewards)
+    mean_rewards_dict["Momentum"] = mom_rewards.mean(dim=0).cpu().numpy()
 
     mr_pos = torch.zeros_like(market_returns)
     mr_pos[:, 1:] = -torch.sign(market_returns[:, :-1])
-    mr_rewards = mr_pos * market_returns
+    mr_rewards = _rewards_from_pos(mr_pos)
     mr_pnl = mr_rewards.cumsum(dim=1)
     trajectories_dict["Mean Reversion"] = mr_pnl.mean(dim=0).cpu().numpy()
     metrics_dict["Mean Reversion"] = compute_financial_metrics(mr_rewards)
+    mean_rewards_dict["Mean Reversion"] = mr_rewards.mean(dim=0).cpu().numpy()
 
-    return trajectories_dict, metrics_dict
+    return trajectories_dict, metrics_dict, mean_rewards_dict
 
 
 # =============================================================================
@@ -580,12 +600,15 @@ def plot_action_distribution_by_rtg(
     if n == 0:
         return
 
-    fig, axes = plt.subplots(2, n, figsize=(max(4 * n, 6), 7), sharex="col")
-    if n == 1:
-        axes = axes.reshape(2, 1)
+    # Do not share x between rows: top uses positions [0,1,2], bottom uses % on [0, 100].
+    # sharex="col" tied the top axis to the bottom scale and squashed the count bars on the left.
+    fig_w = max(3.5 * n + 1.2, 7.0)
+    fig, axes = plt.subplots(2, n, figsize=(fig_w, 8.0), squeeze=False)
 
     action_labels = ["Short", "Flat", "Long"]
     action_colors = ["tab:red", "tab:gray", "tab:green"]
+    x_idx = np.arange(3, dtype=float)
+    bar_w = 0.62
 
     for j, (label, actions) in enumerate(actions_by_rtg.items()):
         actions_arr = np.asarray(actions, dtype=int).ravel()
@@ -600,74 +623,150 @@ def plot_action_distribution_by_rtg(
         ent = max(float(ent), 0.0)
 
         title = label if str(label).startswith("DT ") else f"DT ({label})"
+        ymax = max(float(counts.max()) * 1.18, total * 0.06, 1.0)
 
         ax0 = axes[0, j]
-        bars = ax0.bar(action_labels, counts, color=action_colors, edgecolor="black", linewidth=0.4)
-        ax0.set_title(title, fontsize=10)
-        ax0.set_ylabel("Count")
-        ax0.grid(axis="y", alpha=0.3)
-        ax0.set_ylim(0, max(total * 1.08, 1.0))
+        bars = ax0.bar(
+            x_idx,
+            counts,
+            width=bar_w,
+            color=action_colors,
+            edgecolor="0.25",
+            linewidth=0.65,
+        )
+        ax0.set_title(title, fontsize=11)
+        ax0.set_xticks(x_idx)
+        ax0.set_xticklabels(action_labels, fontsize=10)
+        ax0.set_xlim(-0.6, 2.6)
+        ax0.set_ylabel("Count", fontsize=10)
+        ax0.tick_params(axis="y", labelsize=9)
+        ax0.grid(axis="y", alpha=0.35, linestyle="-", linewidth=0.5)
+        ax0.set_axisbelow(True)
+        ax0.set_ylim(0, ymax)
         for rect, cnt, pc in zip(bars, counts, pcts):
             h = rect.get_height()
-            ax0.text(
-                rect.get_x() + rect.get_width() / 2.0,
-                h + total * 0.01,
-                f"{int(cnt)}\n({pc:.1f}%)",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
+            cx = rect.get_x() + rect.get_width() / 2.0
+            count_s = f"{int(cnt):,}"
+            pct_s = f"{pc:.1f}%"
+            if h >= 0.12 * ymax and h > 0:
+                ax0.text(
+                    cx,
+                    h * 0.5,
+                    f"{pct_s}\n{count_s}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="white",
+                    fontweight="bold",
+                    linespacing=1.1,
+                )
+            else:
+                ax0.text(
+                    cx,
+                    min(h + ymax * 0.02, ymax * 0.995),
+                    f"{count_s}\n({pct_s})",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    linespacing=1.05,
+                )
 
         ax1 = axes[1, j]
-        ax1.barh(action_labels, pcts, color=action_colors, edgecolor="black", linewidth=0.4)
-        ax1.set_xlabel("Share of steps (%)")
-        ax1.set_xlim(0, 105)
-        ax1.axvline(100.0 / 3.0, color="navy", linestyle=":", linewidth=1.0, alpha=0.6)
-        ax1.grid(axis="x", alpha=0.3)
+        ax1.barh(
+            action_labels,
+            pcts,
+            height=0.58,
+            color=action_colors,
+            edgecolor="0.25",
+            linewidth=0.65,
+        )
+        ax1.set_xlabel("Share of steps (%)", fontsize=10)
+        ax1.set_xlim(0, 100)
+        ax1.set_xticks([0, 25, 50, 75, 100])
+        ax1.tick_params(axis="both", labelsize=9)
+        ax1.tick_params(axis="y", pad=6)
+        uline = 100.0 / 3.0
+        ax1.axvline(uline, color="navy", linestyle=":", linewidth=1.1, alpha=0.65, zorder=0)
+        ax1.grid(axis="x", alpha=0.35, linestyle="-", linewidth=0.5)
+        ax1.set_axisbelow(True)
         ax1.text(
             0.98,
-            0.02,
-            f"H={ent:.3f}\n(n={int(total)})",
+            0.03,
+            f"H={ent:.3f}\n(n={int(total):,})",
             transform=ax1.transAxes,
             ha="right",
             va="bottom",
             fontsize=8,
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.7"),
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.9, edgecolor="0.75"),
         )
 
     note = ""
     if rollout_note:
         note = f"\n{rollout_note}"
+
+    lm = min(0.09, 0.05 + 0.012 * n)
+    fig.subplots_adjust(
+        left=lm,
+        right=0.99,
+        top=0.90,
+        bottom=0.12,
+        wspace=0.38,
+        hspace=0.30,
+    )
     fig.suptitle(
         "DT action mix per target RTG (argmax at each step)" + note,
-        fontsize=12,
+        fontsize=13,
         fontweight="bold",
-        y=1.02,
+        y=0.97,
     )
     fig.text(
         0.5,
-        0.01,
+        0.02,
         "33% line = uniform mix. Low H ⇒ near-deterministic policy. High RTG + wrong RTG map ⇒ Flat (see proportional offline RTG).",
         ha="center",
         fontsize=8,
         style="italic",
         color="0.35",
     )
-    plt.tight_layout(rect=(0, 0.04, 1, 0.96))
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
 
 
 def plot_advanced_metrics_comparison(
-    df_metrics: pd.DataFrame, save_path: Path
+    df_metrics: pd.DataFrame,
+    save_path: Path,
+    *,
+    exclude_agent_names: Sequence[str] | None = None,
 ):
-    """Multi-panel bar charts for advanced financial metrics across all agents.
+    """Multi-panel bar charts for advanced financial metrics across agents.
 
     Panels: Sortino, CVaR_95, CVaR_99, MaxDD, Calmar, ProfitFactor, HitRatio.
+
+    Parameters
+    ----------
+    exclude_agent_names
+        Row labels (``df_metrics.index``) to omit so scales are readable.
+        ``None`` defaults to ``("Oracle", "Mean Reversion")`` — non-causal /
+        lookahead baselines that often dominate Sortino/Calmar. Pass ``()`` to
+        keep every agent.
     """
     metric_cols = ["Sortino", "CVaR_95", "CVaR_99", "MaxDD", "Calmar", "ProfitFactor", "HitRatio"]
     available = [c for c in metric_cols if c in df_metrics.columns]
     if not available:
+        return
+
+    if exclude_agent_names is None:
+        excludes = ("Oracle", "Mean Reversion")
+    else:
+        excludes = tuple(exclude_agent_names)
+
+    plot_df = df_metrics
+    if excludes:
+        drop_idx = [n for n in excludes if n in df_metrics.index]
+        if drop_idx:
+            plot_df = df_metrics.drop(index=drop_idx)
+
+    if plot_df.empty:
         return
 
     n = len(available)
@@ -676,13 +775,13 @@ def plot_advanced_metrics_comparison(
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows))
     axes_flat = np.array(axes).ravel()
 
-    agents = df_metrics.index.tolist()
+    agents = plot_df.index.tolist()
     x = np.arange(len(agents))
     bar_width = 0.6
 
     for i, metric in enumerate(available):
         ax = axes_flat[i]
-        values = df_metrics[metric].values.astype(float)
+        values = plot_df[metric].values.astype(float)
         colors = ["tab:green" if v > 0 else "tab:red" for v in values]
         if metric in ("MaxDD", "CVaR_95", "CVaR_99", "VaR_95", "VaR_99"):
             colors = ["tab:red"] * len(values)
@@ -697,10 +796,14 @@ def plot_advanced_metrics_comparison(
         axes_flat[j].set_visible(False)
 
     fig.suptitle("Advanced Financial Metrics Comparison", fontsize=14, fontweight="bold")
+    omit_note = ""
+    if excludes:
+        omit_note = f" Omitted from this figure: {', '.join(excludes)}."
     fig.text(
         0.5,
         0.01,
-        "Oracle / momentum / mean-rev use different information sets than DT; bars are not 'fair' head-to-head.",
+        "Excludes unfair comparators (see list below). Momentum & buy-hold still use different signals than DT."
+        + omit_note,
         ha="center",
         fontsize=8,
         style="italic",
@@ -789,13 +892,31 @@ def evaluate_model(
         f"[{', '.join(f'{v:.6g}' for v in target_rtgs[:8])}"
         f"{'…' if len(target_rtgs) > 8 else ''}]"
     )
+    rtg_scaler = load_rtg_scaler(eval_cfg, train_data_path)
+    rtg_reward_scale = 1.0
+    if rtg_scaler is not None:
+        rtg_reward_scale = 1.0 / float(rtg_scaler["rtg_std"])
+        print(
+            "Loaded RTG scaler: "
+            f"mu={rtg_scaler['rtg_mean']:.6g}, std={rtg_scaler['rtg_std']:.6g}. "
+            f"Autoregressive update uses R_(t+1)=R_t-r_t/std."
+        )
+    else:
+        print(
+            "No RTG scaler found; using unscaled autoregressive update R_(t+1)=R_t-r_t."
+        )
 
-    rtg_rollout_mode = getattr(eval_cfg, "rtg_rollout_mode", "anchored_offline")
+    rtg_rollout_mode = getattr(eval_cfg, "rtg_rollout_mode", "autoregressive")
+    if rtg_rollout_mode != "autoregressive":
+        raise ValueError(
+            "Evaluation now supports only autoregressive RTG rollout: "
+            "R_{t+1} = R_t - r_t. Set evaluation.rtg_rollout_mode=autoregressive."
+        )
+    transaction_cost = float(getattr(eval_cfg, "transaction_cost", 0.0))
     print(
-        f"RTG rollout mode: {rtg_rollout_mode!r} — "
-        "autoregressive: Rₜ₊₁ = Rₜ − rₜ (locks to Flat if rₜ≡0). "
-        "anchored_offline: R_{b,t}=ref_{b,t}·(target/ref_{b,0}) if |ref_{b,0}|>ε "
-        "else additive offset."
+        f"RTG rollout mode: {rtg_rollout_mode!r} — autoregressive update "
+        "(Rₜ₊₁ = Rₜ − rₜ). "
+        f"transaction_cost={transaction_cost:.6g}."
     )
 
     max_ts = int(getattr(model_cfg, "max_timestep", 10_000))
@@ -825,11 +946,6 @@ def evaluate_model(
 
     print(f"Batch constructed: Shape {states_batch.shape}")
 
-    reference_rtg = torch.stack([
-        torch.tensor(traj["rtg"][:min_len, 0], dtype=torch.float32)
-        for traj in trajectories
-    ]).to(device)
-
     # ---- 3. Market returns ---------------------------------------------------
     market_returns = get_market_returns(
         states_batch, state_representation=state_representation
@@ -844,16 +960,17 @@ def evaluate_model(
     # ---- 4. Baselines --------------------------------------------------------
     print("\n--- Evaluating Baselines ---")
     t0 = time.perf_counter()
-    base_trajs, base_metrics = evaluate_baselines(market_returns)
+    base_trajs, base_metrics, base_mean_rewards = evaluate_baselines(
+        market_returns, transaction_cost=transaction_cost
+    )
     baseline_elapsed = time.perf_counter() - t0
 
     all_trajectories.update(base_trajs)
     all_metrics.update(base_metrics)
+    all_mean_rewards.update(base_mean_rewards)
 
     for name in base_trajs:
         inference_times[name] = baseline_elapsed / len(base_trajs)
-        mr = market_returns.mean(dim=0).cpu().numpy()
-        all_mean_rewards[name] = mr
 
     # ---- 5. Decision Transformer across RTG targets --------------------------
     print("\n--- Evaluating Decision Transformer ---")
@@ -869,10 +986,9 @@ def evaluate_model(
             context_len=eval_cfg.context_len,
             device=device,
             max_timestep=max_ts,
-            rtg_rollout_mode=rtg_rollout_mode,
+            transaction_cost=transaction_cost,
+            rtg_reward_scale=rtg_reward_scale,
         )
-        if rtg_rollout_mode == "anchored_offline":
-            rr_kw["reference_rtg"] = reference_rtg
         realized_rewards, predicted_pos, predicted_actions = (
             vectorized_autoregressive_rollout(**rr_kw)
         )
@@ -940,11 +1056,14 @@ def evaluate_model(
         actions_by_rtg,
         out_path / "action_distribution_by_rtg.png",
         rollout_note=(
-            f"RTG rollout: {rtg_rollout_mode} (offline: proportional to ref RTG, R₀=target)"
+            f"RTG rollout: {rtg_rollout_mode} (causal update Rₜ₊₁=Rₜ−rₜ)"
         ),
     )
+    adv_excl = getattr(eval_cfg, "advanced_metrics_exclude_agents", None)
     plot_advanced_metrics_comparison(
-        df_metrics, out_path / "advanced_metrics_comparison.png"
+        df_metrics,
+        out_path / "advanced_metrics_comparison.png",
+        exclude_agent_names=adv_excl,
     )
     plot_inference_time(inference_times, out_path / "inference_time_comparison.png")
 
@@ -978,13 +1097,10 @@ def evaluate_model(
                 chron_states[0, :, :f_dim] = tails
                 chron_states_t = torch.from_numpy(chron_states).to(device)
                 chron_returns = torch.from_numpy(ret1d.reshape(1, -1)).to(device)
-                r1 = chron_returns.squeeze(0).float()
-                chron_ref_rtg = torch.flip(
-                    torch.cumsum(torch.flip(r1, dims=(0,)), dim=0), dims=(0,)
-                ).unsqueeze(0)
-
                 chron_trajs: dict[str, np.ndarray] = {}
-                cbase_trajs, _ = evaluate_baselines(chron_returns)
+                cbase_trajs, _, _ = evaluate_baselines(
+                    chron_returns, transaction_cost=transaction_cost
+                )
                 chron_trajs.update(cbase_trajs)
 
                 for rtg in target_rtgs:
@@ -996,10 +1112,9 @@ def evaluate_model(
                         context_len=eval_cfg.context_len,
                         device=device,
                         max_timestep=max_ts,
-                        rtg_rollout_mode=rtg_rollout_mode,
+                        transaction_cost=transaction_cost,
+                        rtg_reward_scale=rtg_reward_scale,
                     )
-                    if rtg_rollout_mode == "anchored_offline":
-                        cr_kw["reference_rtg"] = chron_ref_rtg.to(device)
                     rr, _, _ = vectorized_autoregressive_rollout(**cr_kw)
                     label = f"DT (RTG={rtg:.6g})"
                     chron_trajs[label] = rr.cumsum(dim=1).squeeze(0).cpu().numpy()
@@ -1023,6 +1138,7 @@ def evaluate_model(
             )
 
     print(f"Visualisations saved to '{out_path.absolute()}'.")
+    return df_metrics
 
 
 # =============================================================================
@@ -1072,9 +1188,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rtg_rollout_mode",
         type=str,
-        default="anchored_offline",
-        choices=("autoregressive", "anchored_offline"),
-        help="How RTG is conditioned during rollout (see evaluate_model docstring).",
+        default="autoregressive",
+        choices=("autoregressive",),
+        help="RTG rollout mode (causal autoregressive update only).",
+    )
+    parser.add_argument(
+        "--transaction_cost",
+        type=float,
+        default=0.0,
+        help="Per-unit transaction cost applied at evaluation: c*|pos_t-pos_{t-1}|.",
     )
     parser.add_argument("--generator_window_size", type=int, default=100)
     parser.add_argument("--generator_price_offset", type=float, default=10.0)
@@ -1102,6 +1224,7 @@ if __name__ == "__main__":
         max_eval_trajectories=args.max_eval_trajectories,
         continuous_day10_plot=args.continuous_day10_plot,
         rtg_rollout_mode=args.rtg_rollout_mode,
+        transaction_cost=args.transaction_cost,
     )
 
     evaluate_model(

@@ -66,6 +66,10 @@ def main(cfg: DictConfig) -> None:
             state_representation=cfg.generator.state_representation,
             price_offset=float(cfg.generator.price_offset),
             reward_horizon=int(reward_horizon) if reward_horizon is not None else None,
+            quality_filter_mode=str(cfg.generator.get("quality_filter_mode", "none")),
+            quality_quantile=float(cfg.generator.get("quality_quantile", 0.8)),
+            standardize_rtg=bool(cfg.generator.get("standardize_rtg", True)),
+            rtg_scaler_out=cfg.generator.get("rtg_scaler_out", None),
         )
     else:
         log.info("Skipping Data Generation Phase.")

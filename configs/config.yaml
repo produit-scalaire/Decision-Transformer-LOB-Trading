@@ -10,7 +10,7 @@ pipeline:
 
 # Hardware specific settings (Optimized for Ryzen 9 9950X & RTX 5090)
 hardware:
-  workers: 6
+  workers: 4
   device: "cuda"
   compile_model: true  # Torch 2.x max-autotune
 
@@ -42,6 +42,13 @@ generator:
   # raw: LOB as loaded | log_returns | bps (price channels only; volumes unchanged)
   state_representation: raw
   price_offset: 10.0
+  # Elitist train filtering (no policy quotas). Modes: none | top_quantile | positive_only
+  quality_filter_mode: top_quantile
+  quality_quantile: 0.5
+  # Standardize RTG with train-set z-score: (rtg - mu_train) / sigma_train
+  standardize_rtg: true
+  # Optional explicit path. null -> "<train_data_stem>_rtg_scaler.pt" next to train_data
+  rtg_scaler_out: null
 
 # Decision Transformer architecture
 # Set architecture: "transformer" to use the original DT (default).
@@ -69,13 +76,15 @@ training:
 
 # Inference & Validation
 evaluation:
-  # RTG tokens during rollout:
-  #   autoregressive — R_{t+1} = R_t − r_t (if r_t≡0 ⇒ RTG frozen ⇒ often all-Flat).
-  #   anchored_offline — R_{b,t} = traj_rtg[b,t]·(target/traj_rtg[b,0]) when |ref₀|>ε; else additive offset.
-  rtg_rollout_mode: anchored_offline  # autoregressive | anchored_offline
+  # RTG tokens during rollout (causal DT update).
+  #   autoregressive — R_{t+1} = R_t − r_t
+  rtg_rollout_mode: autoregressive
+  # Optional friction term used in evaluation rewards:
+  #   r_t = pos_t * ret_t - transaction_cost * |pos_t - pos_{t-1}|
+  transaction_cost: 0.0
   # RTG at t=0 must match training scale (sum of episode rewards). Use train_percentiles
-  # so targets align with the offline dataset; manual values are often far too small.
-  rtg_source: train_percentiles  # manual | train_percentiles
+  # so targets align with the offline dataset after RTG standardization.
+  rtg_source: manual  # manual | train_percentiles
   # Manual fallback: values MUST match the RTG scale from training data.
   # For 2000-step episodes on z-scored FI-2010 LOB, per-episode oracle
   # return is typically ~0.1–0.6; values far above that are out-of-distribution
@@ -84,5 +93,10 @@ evaluation:
   train_rtg_percentiles: [10, 25, 50, 75, 90]
   context_len: 100
   max_eval_trajectories: 32
+  # Advanced-metrics bar chart: drop baselines that crush the y-axis (non-causal etc.).
+  # Use [] to show everyone. Default null → code uses Oracle + Mean Reversion.
+  advanced_metrics_exclude_agents:
+    - Oracle
+    - Mean Reversion
   # Single pass over the full FI-2010 test file (Day 10); needs kagglehub dataset cache.
   continuous_day10_plot: true
